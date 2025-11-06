@@ -1,0 +1,37 @@
+version: "3.8"
+
+services:
+  hub:
+    build: ./hub
+    container_name: recon-hub
+    restart: unless-stopped
+
+    # Needed for RTL-SDR access from inside container
+    privileged: true
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb
+
+    environment:
+      # Base ports for IQ and control sockets
+      - IQ_BASE_PORT=5550
+      - CTL_BASE_PORT=6000
+
+      # Max number of SDRs to probe (indices 0..MAX_SDRS-1)
+      - MAX_SDRS=8
+
+      # How long (seconds) with no IQ data before considering dormant
+      - MONITOR_DORMANT_SEC=10
+
+    ports:
+      - "8080:8080"              # Web GUI
+      # A small range of IQ ports (up to 8 SDRs -> 5550–5557)
+      - "5550-5557:5550-5557"
+      # A small range of control ports (6000–6007)
+      - "6000-6007:6000-6007"
+
+  fft-viewer:
+    build: ./tools/fft-viewer
+    depends_on:
+      - hub
+    ports:
+      - "8090:8090"
