@@ -7,7 +7,8 @@ import threading
 import socketserver
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, List
+import re
 
 from flask import Flask, jsonify
 
@@ -52,28 +53,88 @@ class SDRDevice:
 # ----------------- RTL-SDR discovery -----------------
 
 
-def rtl_device_exists(idx: int) -> bool:
+_rtl_device_cache: Optional[List[Tuple[int, str]]] = None
+
+
+def _probe_rtl_devices() -> List[Tuple[int, str]]:
+    """
+    Run rtl_test once (with an invalid index so it doesn't lock a device)
+    and parse out all (index, serial) pairs.
+
+    Returns:
+        List of (idx, serial) tuples.
+    """
+    global _rtl_device_cache
+    if _rtl_device_cache is not None:
+        return _rtl_device_cache
+
     try:
+        # Use -d 1000000 so rtl_test never successfully opens a device,
+        # but still prints the inventory header.
         out = subprocess.check_output(
-            ["rtl_test", "-d", str(idx), "-t"],
+            ["rtl_test", "-d", "1000000"],
             stderr=subprocess.STDOUT,
             text=True,
             timeout=10,
         )
-    except Exception:
-        return False
-    return "No supported devices found" not in out
+    except subprocess.CalledProcessError as e:
+        # Non-zero exit (e.g. "Failed to open device") but we still get the listing
+        out = e.output
+    except Exception as e:
+        print(f"[hub] rtl_test probe failed: {e}")
+        _rtl_device_cache = []
+        return _rtl_device_cache
+
+    devices: List[Tuple[int, str]] = []
+
+    # Look for lines like:
+    #   0:  Realtek, RTL2838UHIDIR, SN: 001
+    #   1:  Realtek, RTL2838UHIDIR, SN: 002
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d+):\s+.*SN:\s*([^\s]+)", line)
+        if m:
+            idx = int(m.group(1))
+            serial = m.group(2)
+            devices.append((idx, serial))
+
+    _rtl_device_cache = devices
+    return devices
+
+
+def rtl_device_exists(idx: int) -> Optional[str]:
+    """
+    Return the serial number for a given rtl-sdr index, or None if it doesn't exist.
+    """
+    for dev_idx, serial in _probe_rtl_devices():
+        if dev_idx == idx:
+            return serial
+    return None
 
 
 def discover_sdrs():
     print("[hub] Discovering RTL-SDR devices with rtl_test...")
-    for idx in range(MAX_SDRS):
-        if not rtl_device_exists(idx):
+
+    devices = _probe_rtl_devices()
+    if not devices:
+        print("[hub] WARNING: No RTL-SDR devices detected.")
+        return
+
+    for idx, serial in devices:
+        # Optional: still respect MAX_SDRS based on index
+        if idx >= MAX_SDRS:
             continue
-        serial = f"SDR{idx:03d}"
-        iq_port = IQ_BASE_PORT + idx       # exposed relay port
-        rtl_port = RTL_BASE_PORT + idx     # internal rtl_tcp port
-        control_port = CTL_BASE_PORT + idx
+
+        # Use the SN to derive port offsets, stable per physical stick
+        if serial.isdigit():
+            serial_int = int(serial)
+        else:
+            # Fallback if some weird non-numeric SN shows up
+            serial_int = abs(hash(serial)) % 1000
+
+        iq_port = IQ_BASE_PORT + serial_int        # exposed relay port
+        rtl_port = RTL_BASE_PORT + serial_int      # internal rtl_tcp port
+        control_port = CTL_BASE_PORT + serial_int  # control port
+
         dev = SDRDevice(
             index=idx,
             serial=serial,
@@ -84,20 +145,24 @@ def discover_sdrs():
         dev.status = "discovered"
         dev.last_data_time = time.time()
         sdrs[serial] = dev
+
         print(
-            f"[hub] Found RTL-SDR index={idx} as {serial}, "
+            f"[hub] Found RTL-SDR index={idx}, serial={serial}, "
             f"rtl_tcp={rtl_port}, IQ={iq_port}, CTL={control_port}"
         )
-    if not sdrs:
-        print("[hub] WARNING: No RTL-SDR devices detected.")
 
 
 # ----------------- rtl_tcp process control -----------------
 
 
 def build_rtl_tcp_cmd(dev: SDRDevice):
-    # rtl_tcp binds ONLY on localhost, on internal rtl_port
-    cmd = ["rtl_tcp", "-d", str(dev.index), "-a", "127.0.0.1", "-p", str(dev.rtl_port)]
+    # rtl_tcp uses *device index* for -d, not serial
+    cmd = [
+        "rtl_tcp",
+        "-d", str(dev.index),            # <-- use index here
+        "-a", "127.0.0.1",
+        "-p", str(dev.rtl_port),
+    ]
     if dev.center_freq:
         cmd += ["-f", str(dev.center_freq)]
     if dev.sample_rate:
@@ -117,10 +182,24 @@ def start_rtl_tcp(dev: SDRDevice):
         dev.last_data_time = time.time()
         dev._bytes_window = 0
         dev._last_throughput_ts = time.time()
+
+        # TEMP: capture stderr so we can see errors in docker logs
         dev.rtl_tcp_proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         dev.status = "running"
+
+        # Optional: background thread to log stderr lines
+        def _log_stderr(p, serial):
+            for line in p.stderr:
+                print(f"[rtl_tcp {serial}] {line.rstrip()}")
+
+        threading.Thread(
+            target=_log_stderr, args=(dev.rtl_tcp_proc, dev.serial), daemon=True
+        ).start()
 
 
 def stop_rtl_tcp(dev: SDRDevice):
