@@ -49,9 +49,12 @@ class SDRDevice:
         self.relay_clients = set()
         self.relay_lock = threading.Lock()
 
+        # Underlying rtl_tcp stream socket (hub -> rtl_tcp)
+        self.stream_sock: Optional[socket.socket] = None
+        self.stream_lock = threading.Lock()
+
 
 # ----------------- RTL-SDR discovery -----------------
-
 
 _rtl_device_cache: Optional[List[Tuple[int, str]]] = None
 
@@ -60,9 +63,6 @@ def _probe_rtl_devices() -> List[Tuple[int, str]]:
     """
     Run rtl_test once (with an invalid index so it doesn't lock a device)
     and parse out all (index, serial) pairs.
-
-    Returns:
-        List of (idx, serial) tuples.
     """
     global _rtl_device_cache
     if _rtl_device_cache is not None:
@@ -152,14 +152,13 @@ def discover_sdrs():
         )
 
 
-# ----------------- rtl_tcp process control -----------------
-
+# ----------------- rtl_tcp process + control -----------------
 
 def build_rtl_tcp_cmd(dev: SDRDevice):
     # rtl_tcp uses *device index* for -d, not serial
     cmd = [
         "rtl_tcp",
-        "-d", str(dev.index),            # <-- use index here
+        "-d", str(dev.index),
         "-a", "127.0.0.1",
         "-p", str(dev.rtl_port),
     ]
@@ -183,7 +182,6 @@ def start_rtl_tcp(dev: SDRDevice):
         dev._bytes_window = 0
         dev._last_throughput_ts = time.time()
 
-        # TEMP: capture stderr so we can see errors in docker logs
         dev.rtl_tcp_proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
@@ -192,7 +190,7 @@ def start_rtl_tcp(dev: SDRDevice):
         )
         dev.status = "running"
 
-        # Optional: background thread to log stderr lines
+        # Background thread to log stderr lines
         def _log_stderr(p, serial):
             for line in p.stderr:
                 print(f"[rtl_tcp {serial}] {line.rstrip()}")
@@ -215,16 +213,55 @@ def stop_rtl_tcp(dev: SDRDevice):
         dev.status = "stopped"
         dev.throughput_kbps = 0.0
 
+    # Also drop stream socket reference
+    with dev.stream_lock:
+        if dev.stream_sock is not None:
+            try:
+                dev.stream_sock.close()
+            except Exception:
+                pass
+        dev.stream_sock = None
+
 
 def restart_rtl_tcp(dev: SDRDevice):
     print(f"[hub] Restarting rtl_tcp for {dev.serial}")
     stop_rtl_tcp(dev)
-    time.sleep(0.5)
+    time.sleep(1.0)
     start_rtl_tcp(dev)
 
 
-# ----------------- IQ relay (fan-out) -----------------
+def send_rtl_tcp_cmd(dev: SDRDevice, cmd: int, param: int) -> bool:
+    """
+    Send a 5-byte rtl_tcp control command:
+      [ cmd (uint8) ][ param (uint32 BE) ]
+    Returns True on success, False if no socket or send error.
+    """
+    with dev.stream_lock:
+        sock = dev.stream_sock
 
+    if sock is None:
+        print(f"[hub] {dev.serial} control: no active stream socket for cmd=0x{cmd:02x}")
+        return False
+
+    try:
+        payload = bytes([cmd]) + int(param).to_bytes(4, "big", signed=False)
+        sock.sendall(payload)
+        return True
+    except Exception as e:
+        print(f"[hub] {dev.serial} control: error sending cmd=0x{cmd:02x}: {e}")
+        # Mark socket as dead; reader loop will handle reconnect
+        with dev.stream_lock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            dev.stream_sock = None
+        with dev.lock:
+            dev.status = "error"
+        return False
+
+
+# ----------------- IQ relay (fan-out) -----------------
 
 def iq_relay_accept_loop(dev: SDRDevice):
     """
@@ -266,6 +303,8 @@ def iq_relay_reader_loop(dev: SDRDevice):
     """
     Maintain a single connection to rtl_tcp on dev.rtl_port and broadcast IQ
     data to all connected clients on dev.iq_port.
+    Also keeps dev.stream_sock pointing at the active socket so we can send
+    rtl_tcp control commands without restart.
     """
     rtl_sock = None
 
@@ -291,17 +330,21 @@ def iq_relay_reader_loop(dev: SDRDevice):
                     f"[hub] {dev.serial} relay: connecting to rtl_tcp on 127.0.0.1:{dev.rtl_port}"
                 )
                 rtl_sock = socket.create_connection(("127.0.0.1", dev.rtl_port), timeout=5)
-                rtl_sock.settimeout(1.0)
+                rtl_sock.settimeout(2.0)
+                # Expose this socket for control commands
+                with dev.stream_lock:
+                    dev.stream_sock = rtl_sock
                 with dev.lock:
-                    # Once we have data, we'll mark as "streaming"
                     if dev.status == "running":
                         dev.status = "streaming"
             except Exception as e:
                 print(f"[hub] {dev.serial} relay: failed to connect to rtl_tcp: {e}")
                 rtl_sock = None
+                with dev.stream_lock:
+                    dev.stream_sock = None
                 with dev.lock:
                     dev.status = "error"
-                time.sleep(1.0)
+                time.sleep(2.0)
                 continue
 
         # Read IQ and broadcast
@@ -309,11 +352,16 @@ def iq_relay_reader_loop(dev: SDRDevice):
             data = rtl_sock.recv(4096)
             if not data:
                 print(f"[hub] {dev.serial} relay: rtl_tcp closed connection, reconnecting")
-                rtl_sock.close()
+                try:
+                    rtl_sock.close()
+                except Exception:
+                    pass
                 rtl_sock = None
+                with dev.stream_lock:
+                    dev.stream_sock = None
                 with dev.lock:
                     dev.status = "running"  # we'll try to re-establish
-                time.sleep(0.5)
+                time.sleep(2.0)
                 continue
         except socket.timeout:
             # No data in this window; just loop again
@@ -325,9 +373,11 @@ def iq_relay_reader_loop(dev: SDRDevice):
             except Exception:
                 pass
             rtl_sock = None
+            with dev.stream_lock:
+                dev.stream_sock = None
             with dev.lock:
                 dev.status = "error"
-            time.sleep(0.5)
+            time.sleep(2.0)
             continue
 
         now = time.time()
@@ -377,7 +427,6 @@ def launch_iq_relays():
 
 # ----------------- Control server -----------------
 
-
 def make_control_handler(dev: SDRDevice):
     class ControlHandler(socketserver.StreamRequestHandler):
         def handle(self_inner):
@@ -395,15 +444,46 @@ def make_control_handler(dev: SDRDevice):
                     freq = req.get("freq")
                     sr = req.get("samp_rate")
                     gain = req.get("gain")
+                    print(f"[hub] set_config serial={dev.serial} freq={freq} sr={sr} gain={gain}", flush=True)
+
+                    # Update our in-memory state
                     with dev.lock:
-                        if freq:
+                        if freq is not None:
                             dev.center_freq = int(freq)
-                        if sr:
+                        if sr is not None:
                             dev.sample_rate = int(sr)
                         if gain is not None:
                             dev.gain = int(gain)
-                    # Restart rtl_tcp so new params take effect
-                    restart_rtl_tcp(dev)
+
+                    ok = True
+
+                    # Apply to rtl_tcp on the fly via control protocol
+                    # 0x01 = set frequency (Hz)
+                    if freq is not None:
+                        if not send_rtl_tcp_cmd(dev, 0x01, int(freq)):
+                            ok = False
+
+                    # 0x02 = set sample rate (samples/sec)
+                    if sr is not None:
+                        if not send_rtl_tcp_cmd(dev, 0x02, int(sr)):
+                            ok = False
+
+                    # 0x03 = set gain mode (0=auto, 1=manual)
+                    # 0x04 = set gain (tenths of dB)
+                    if gain is not None:
+                        # enter manual gain mode
+                        if not send_rtl_tcp_cmd(dev, 0x03, 1):
+                            ok = False
+                        # gain in tenths of a dB
+                        if not send_rtl_tcp_cmd(dev, 0x04, int(gain) * 10):
+                            ok = False
+
+                    # If we couldn't talk to rtl_tcp (e.g., socket not ready),
+                    # fall back to restart so new params take effect.
+                    if not ok:
+                        print(f"[hub] {dev.serial} set_config fell back to restart", flush=True)
+                        restart_rtl_tcp(dev)
+
                     resp = {"ok": True, "status": sdr_to_dict(dev)}
 
                 elif cmd == "restart":
@@ -430,7 +510,6 @@ def launch_control_servers():
 
 # ----------------- Web GUI / API -----------------
 
-
 def sdr_to_dict(dev: SDRDevice):
     with dev.lock:
         return {
@@ -449,7 +528,8 @@ def sdr_to_dict(dev: SDRDevice):
 
 @app.route("/api/sdrs")
 def api_sdrs():
-    return jsonify([sdr_to_dict(dev) for dev in sdrs.values()])
+    devs = sorted(sdrs.values(), key=lambda d: d.serial)
+    return jsonify([sdr_to_dict(dev) for dev in devs])
 
 
 @app.route("/api/restart/<serial>", methods=["POST"])

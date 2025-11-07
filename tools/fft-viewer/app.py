@@ -9,16 +9,18 @@ from dataclasses import dataclass, field
 import numpy as np
 import requests
 from flask import Flask, jsonify, request
+from flask_sock import Sock
 
 HUB_URL = os.getenv("HUB_URL", "http://hub:8080")
 HUB_HOST = os.getenv("HUB_HOST", "hub")
 FFT_PORT = int(os.getenv("FFT_PORT", "8090"))
 
-FFT_SIZE = 2048            # internal FFT size
-DOWNSAMPLED_BINS = 512     # bins sent to browser
-IDLE_TIMEOUT = 30.0        # seconds without browser polls => disconnect IQ
+FFT_SIZE = 1024           # internal FFT size, was 2048
+DOWNSAMPLED_BINS = 256     # bins sent to browser, was 512
+IDLE_TIMEOUT = 30.0        # seconds without viewer activity => disconnect IQ
 
 app = Flask(__name__)
+sock = Sock(app)
 
 
 # --------- Helpers to talk to hub ---------
@@ -38,12 +40,15 @@ def find_sdr(serial):
 
 
 def send_control(serial, freq=None, samp_rate=None, gain=None):
+    print(f"[fft] send_control: serial={serial} freq={freq} sr={samp_rate} gain={gain}", flush=True)
     dev = find_sdr(serial)
     if not dev:
+        print(f"[fft] send_control: not_found for serial={serial}", flush=True)
         return {"ok": False, "error": "not_found"}
 
     ctl_port = dev.get("control_port")
     if not ctl_port:
+        print(f"[fft] send_control: missing control_port for serial={serial}", flush=True)
         return {"ok": False, "error": "missing_control_port"}
 
     cmd = {"cmd": "set_config"}
@@ -54,14 +59,18 @@ def send_control(serial, freq=None, samp_rate=None, gain=None):
     if gain is not None:
         cmd["gain"] = int(gain)
 
+    print(f"[fft] send_control -> hub:{ctl_port} {cmd}", flush=True)
+
     try:
         with socket.create_connection((HUB_HOST, ctl_port), timeout=5) as s:
             s.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
             data = s.recv(4096).decode("utf-8").strip()
+            print(f"[fft] send_control resp: {data}", flush=True)
             if not data:
                 return {"ok": False, "error": "no_response"}
             return json.loads(data)
     except Exception as e:
+        print(f"[fft] send_control error: {e}", flush=True)
         return {"ok": False, "error": str(e)}
 
 
@@ -115,7 +124,7 @@ def stream_worker(state: StreamState):
         now = time.time()
         idle = now - state.last_access
 
-        # If nobody has hit /api/fft for a while, close IQ and idle.
+        # If nobody has hit the viewer for a while, close IQ and idle.
         if idle > IDLE_TIMEOUT:
             if sock is not None:
                 try:
@@ -154,6 +163,7 @@ def stream_worker(state: StreamState):
             try:
                 sock = socket.create_connection((HUB_HOST, iq_port), timeout=5)
                 sock.settimeout(1.0)
+                print(f"[fft] stream_worker: connected to IQ for serial={state.serial} port={iq_port}", flush=True)
                 with state.lock:
                     state.last_error = None
             except Exception as e:
@@ -210,7 +220,44 @@ def stream_worker(state: StreamState):
             # last_error stays as-is if None / cleared earlier
 
 
-# --------- API endpoints ---------
+# --------- WebSocket FFT endpoint (Flask-Sock) ---------
+
+
+@sock.route("/ws/fft/<serial>")
+def ws_fft(ws, serial):
+    """
+    WebSocket: push FFT bins for this SDR at a steady rate.
+    Uses the same StreamState / stream_worker as the HTTP polling path.
+    """
+    print(f"[fft] WebSocket client connected for serial={serial}", flush=True)
+    state = ensure_stream(serial)
+
+    try:
+        while True:
+            state.last_access = time.time()
+
+            with state.lock:
+                bins = list(state.latest_bins)
+                err = state.last_error
+
+            if not bins:
+                msg = {"ok": False, "serial": serial, "error": err or "no_data_yet"}
+            else:
+                msg = {"ok": True, "serial": serial, "bins": bins, "error": err}
+
+            ws.send(json.dumps(msg))
+            # ~20 Hz
+            # time.sleep(0.05) 
+            time.sleep(0.02) #was .05
+    except Exception as e:
+        # Any send/connection error ends up here – treat it as a normal close.
+        print(f"[fft] WebSocket closed for serial={serial}: {e}", flush=True)
+    finally:
+        print(f"[fft] WebSocket handler exit for serial={serial}", flush=True)
+
+
+
+# --------- HTTP API (SDR list, config, optional FFT fallback) ---------
 
 
 @app.get("/api/sdrs")
@@ -223,6 +270,7 @@ def api_sdrs():
 
 @app.post("/api/sdr/<serial>/config")
 def api_config_sdr(serial):
+    print(f"[fft] api_config_sdr hit for serial={serial}", flush=True)
     data = request.get_json(force=True) or {}
     freq = data.get("freq")
     sr = data.get("samp_rate") or data.get("rate")
@@ -235,9 +283,7 @@ def api_config_sdr(serial):
 @app.get("/api/fft/<serial>")
 def api_fft(serial):
     """
-    Return the latest FFT bins for this SDR.
-    Ensures a background stream worker is running and touching the IQ port
-    *only while* this endpoint is being polled.
+    Optional HTTP polling FFT endpoint (not used by the WS UI, but handy for debugging).
     """
     state = ensure_stream(serial)
     state.last_access = time.time()
@@ -381,7 +427,7 @@ class FFTPanel {
   constructor(id) {
     this.id = id;
     this.serial = null;
-    this.timer = null;
+    this.ws = null;
 
     this.root = document.createElement("div");
     this.root.className = "panel";
@@ -473,47 +519,60 @@ class FFTPanel {
   setSerial(serial) {
     if (serial === this.serial) return;
     this.serial = serial || null;
-    this.stopTimer();
+    this.closeWS();
     if (this.serial) {
       this.status.textContent = `Viewing ${this.serial}`;
-      this.startTimer();
+      this.openWS();
     } else {
       this.status.textContent = "Idle";
       this.drawEmpty();
     }
   }
 
-  startTimer() {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = setInterval(() => this.fetchFFT(), 200); // 5 Hz
-    this.fetchFFT(); // immediate first frame
-  }
-
-  stopTimer() {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-  }
-
-  async fetchFFT() {
+  openWS() {
     if (!this.serial) return;
-    try {
-      const res = await fetch(`/api/fft/${encodeURIComponent(this.serial)}`);
-      if (!res.ok) return;
-      const data = await res.json();
-      if (!data) return;
-      if (!data.ok || !data.bins) {
-        if (data.error) {
-          this.status.textContent = `Error: ${data.error}`;
+    const loc = window.location;
+    const proto = loc.protocol === "https:" ? "wss" : "ws";
+    const url = `${proto}://${loc.host}/ws/fft/${encodeURIComponent(this.serial)}`;
+    const ws = new WebSocket(url);
+    this.ws = ws;
+
+    ws.onopen = () => {
+      this.status.textContent = `Viewing ${this.serial} (live)`;
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (!data.ok || !data.bins) {
+          if (data.error) {
+            this.status.textContent = `Error: ${data.error}`;
+          }
+          return;
         }
-        return;
+        this.status.textContent = `Viewing ${this.serial} (live)`;
+        this.drawSpectrum(data.bins);
+        this.drawWaterfall(data.bins);
+      } catch (e) {
+        this.status.textContent = "Error parsing data";
       }
-      this.status.textContent = `Viewing ${this.serial}`;
-      this.drawSpectrum(data.bins);
-      this.drawWaterfall(data.bins);
-    } catch (e) {
-      this.status.textContent = "Error fetching FFT";
+    };
+
+    ws.onerror = () => {
+      this.status.textContent = "WebSocket error";
+    };
+
+    ws.onclose = () => {
+      if (this.serial) {
+        this.status.textContent = "WebSocket closed";
+      }
+    };
+  }
+
+  closeWS() {
+    if (this.ws) {
+      try { this.ws.close(); } catch(e) {}
+      this.ws = null;
     }
   }
 
@@ -603,11 +662,10 @@ class FFTPanel {
       const v = bins[idx];
       const norm = Math.max(0, Math.min(1, (v - minVal) / span));
 
-      // Simple blue->cyan->yellow-ish gradient
       const i4 = x * 4;
       const b = Math.floor(255 * norm);
       const g = Math.floor(255 * norm);
-      const r = Math.floor(255 * Math.pow(norm, 0.5)); // a bit brighter high
+      const r = Math.floor(255 * Math.pow(norm, 0.5));
 
       data[i4 + 0] = r;
       data[i4 + 1] = g;
@@ -619,7 +677,7 @@ class FFTPanel {
   }
 
   destroy() {
-    this.stopTimer();
+    this.closeWS();
     this.root.remove();
     panels.delete(this.id);
   }
@@ -641,4 +699,5 @@ setInterval(loadSDRs, 5000);
 
 
 if __name__ == "__main__":
+    # Flask dev server; works fine for this internal tool and supports Flask-Sock websockets
     app.run(host="0.0.0.0", port=FFT_PORT, threaded=True)
