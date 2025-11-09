@@ -21,7 +21,7 @@ _last_start = None
 # Current settings / state
 state = {
     "running": False,
-    "freq": 453.45e6,        # Hz, just some default
+    "freq": 453.45e6,        # Hz, default
     "bandwidth": 50e3,       # Hz, good for ~25 kHz FM channels
     "gain": 0,               # 0 = auto
     "samplerate": 48000,     # audio sample rate for aplay
@@ -29,10 +29,16 @@ state = {
     "volume": 80,            # percent (amixer)
     "device_index": 0,       # which RTL-SDR: 0, 1, ...
     "squelch": 20,           # rtl_fm -l value (0=off)
+    # Beep / detection config
+    "open_threshold": 2000,  # audio level needed to consider "open"
+    "close_threshold": 250, # level below which we consider "closed" again
+    "beep_freq": 1000,       # Hz, tone for this SDR
 }
 
 def make_beep(sr=48000, freq=1000, duration=0.06, volume=0.4):
-    """Generate a short S16_LE mono beep."""
+    """
+    Generate a short S16_LE mono beep.
+    """
     n_samples = int(sr * duration)
     frames = []
     for n in range(n_samples):
@@ -40,49 +46,67 @@ def make_beep(sr=48000, freq=1000, duration=0.06, volume=0.4):
         frames.append(struct.pack("<h", sample))
     return b"".join(frames)
 
-_BEEP_CHUNK = make_beep()
-
 HTML = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8" />
 <title>RTL-FM Controller</title>
 <style>
-body { font-family: system-ui, sans-serif; padding: 20px; max-width: 700px; }
+body { font-family: system-ui, sans-serif; padding: 20px; max-width: 750px; }
 label { display:block; margin-top:8px; }
 input[type="number"], input[type="text"] { width: 220px; padding:5px; }
 button { margin-top:10px; padding:6px 10px; }
 pre { background:#111; color:#eee; padding:8px; max-height:200px; overflow:auto; }
 .status { margin-top: 12px; border: 1px solid #ccc; border-radius:5px; padding:8px; }
 .range-row { display:flex; align-items:center; gap:10px; margin-top:8px; }
+.inline { display:flex; gap:16px; flex-wrap:wrap; }
+.inline > div { min-width: 220px; }
+small { color:#555; }
 </style>
 </head>
 <body>
 <h2>RTL-FM Controller</h2>
 
-<label>Frequency (MHz)
-  <input id="freq" type="number" step="0.001" value="453.450">
-</label>
-<label>Bandwidth (kHz)
-  <input id="bandwidth" type="number" step="1" value="50">
-</label>
-<label>Gain (0=auto)
-  <input id="gain" type="number" step="1" value="0">
-</label>
-<label>SDR Index (-d)
-  <input id="device_index" type="number" step="1" value="0">
-</label>
-<label>Squelch (-l, 0 = off)
-  <input id="squelch" type="number" step="1" value="20">
-</label>
-<label>Audio Device
-  <input id="audio_device" type="text" value="plughw:2,0">
-</label>
+<div class="inline">
+  <div>
+    <label>Frequency (MHz)
+      <input id="freq" type="number" step="0.001" value="453.450">
+    </label>
+    <label>Bandwidth (kHz)
+      <input id="bandwidth" type="number" step="1" value="50">
+    </label>
+    <label>Gain (0=auto)
+      <input id="gain" type="number" step="1" value="0">
+    </label>
+    <label>SDR Index (-d)
+      <input id="device_index" type="number" step="1" value="0">
+    </label>
+    <label>Squelch (-l, 0 = off)
+      <input id="squelch" type="number" step="1" value="20">
+    </label>
+    <label>Audio Device
+      <input id="audio_device" type="text" value="plughw:2,0">
+    </label>
+  </div>
 
-<div class="range-row">
-  <label style="margin-top:0;">Volume (%)</label>
-  <input id="volume" type="range" min="0" max="100" value="80">
-  <span id="volumeVal">80</span>
+  <div>
+    <div class="range-row">
+      <label style="margin-top:0;">Volume (%)</label>
+      <input id="volume" type="range" min="0" max="100" value="80">
+      <span id="volumeVal">80</span>
+    </div>
+    <label>Beep frequency (Hz)
+      <input id="beep_freq" type="number" step="50" value="1000">
+    </label>
+    <small>Use different beep frequencies on each SDR (e.g. 800 Hz vs 1500 Hz)</small>
+    <label>Open threshold (audio level)
+      <input id="open_threshold" type="number" step="100" value="3000">
+    </label>
+    <label>Close threshold (audio level)
+      <input id="close_threshold" type="number" step="100" value="1500">
+    </label>
+    <small>Set close threshold &lt; open threshold to avoid chattering.</small>
+  </div>
 </div>
 
 <div>
@@ -114,6 +138,9 @@ const volInput    = document.getElementById('volume');
 const volLabel    = document.getElementById('volumeVal');
 const statusBox   = document.getElementById('statusBox');
 const logText     = document.getElementById('logText');
+const beepFreqInput   = document.getElementById('beep_freq');
+const openThreshInput = document.getElementById('open_threshold');
+const closeThreshInput= document.getElementById('close_threshold');
 
 async function refresh(){
   try {
@@ -127,6 +154,9 @@ async function refresh(){
        <b>SDR index (-d):</b> ${s.device_index}<br>
        <b>Audio:</b> ${s.audio_device}<br>
        <b>Volume:</b> ${s.volume}%<br>
+       <b>Beep freq:</b> ${s.beep_freq} Hz<br>
+       <b>Open threshold:</b> ${s.open_threshold}<br>
+       <b>Close threshold:</b> ${s.close_threshold}<br>
        <b>PID rtl_fm:</b> ${s.pid_rtl || '-'}<br>
        <b>PID aplay:</b> ${s.pid_aplay || '-'}<br>
        <b>Last start:</b> ${s.last_start ? new Date(s.last_start*1000).toLocaleString() : '-'}`;
@@ -147,6 +177,12 @@ async function refresh(){
       volInput.value = s.volume;
       volLabel.textContent = s.volume;
     }
+    if (document.activeElement !== beepFreqInput)
+      beepFreqInput.value = s.beep_freq;
+    if (document.activeElement !== openThreshInput)
+      openThreshInput.value = s.open_threshold;
+    if (document.activeElement !== closeThreshInput)
+      closeThreshInput.value = s.close_threshold;
   } catch (e) {
     statusBox.innerHTML = "Error fetching status: " + e;
   }
@@ -159,7 +195,10 @@ document.getElementById('start').onclick = async () => {
     gain: parseInt(gainInput.value),
     device_index: parseInt(devIdxInput.value),
     squelch: parseInt(sqlInput.value),
-    audio_device: devInput.value
+    audio_device: devInput.value,
+    beep_freq: parseInt(beepFreqInput.value),
+    open_threshold: parseInt(openThreshInput.value),
+    close_threshold: parseInt(closeThreshInput.value),
   };
   try {
     const r = await j('/api/start', 'POST', payload);
@@ -287,7 +326,6 @@ def _stop_current_locked():
     """Stop current rtl_fm + aplay; caller must hold _proc_lock."""
     global _rtl_proc, _aplay_proc, _pipe_thread
 
-    # Stop the pipe thread by killing procs; thread will exit on EOF/pipe error.
     if _rtl_proc is not None and _rtl_proc.poll() is None:
         try:
             _rtl_proc.send_signal(signal.SIGINT)
@@ -305,18 +343,19 @@ def _stop_current_locked():
                 pass
     _rtl_proc = None
 
-    if _aplay_proc is not None and _aplay_proc.poll() is None:
-        try:
-            _aplay_proc.terminate()
-        except Exception:
-            pass
-        try:
-            _aplay_proc.wait(timeout=3)
-        except Exception:
+    if _aplay_proc is not None:
+        if _aplay_proc.poll() is None:
             try:
-                _aplay_proc.kill()
+                _aplay_proc.terminate()
             except Exception:
                 pass
+            try:
+                _aplay_proc.wait(timeout=3)
+            except Exception:
+                try:
+                    _aplay_proc.kill()
+                except Exception:
+                    pass
     _aplay_proc = None
 
     _pipe_thread = None
@@ -325,15 +364,39 @@ def _stop_current_locked():
 
 def _pipe_audio_loop():
     """
-    Forward PCM from rtl_fm -> aplay and detect squelch-open events
-    to inject a short beep once per open.
+    Forward PCM from rtl_fm -> aplay and inject a single beep
+    when squelch "opens" (carrier/audio present).
+
+    Logic:
+      - Use open_threshold / close_threshold (hysteresis).
+      - squelch_open latches once audio is strong.
+      - We beep only when transitioning from closed -> open,
+        AND at least MIN_BEEP_INTERVAL seconds since last beep.
+      - squelch_open is cleared only after level has been low
+        for HANG_SEC seconds.
+
+    This yields:
+      - One beep at the start of a talk-spurt.
+      - No beeps on closing.
+      - No rapid multi-beeps from tiny dips in level.
     """
     global _pipe_thread
 
+    # Snapshot config once for this run
+    with _proc_lock:
+        open_th = int(state.get("open_threshold", 3000))
+        close_th = int(state.get("close_threshold", 1500))
+        beep_freq = int(state.get("beep_freq", 1000))
+        beep_freq = max(200, min(beep_freq, 4000))
+        beep_chunk = make_beep(sr=int(state["samplerate"]), freq=beep_freq)
+
+    # Tunables
+    HANG_SEC = 0.7           # keep squelch_open this long after last strong audio
+    MIN_BEEP_INTERVAL = 1.2  # minimum time between beeps
+
     squelch_open = False
+    last_strong_time = 0.0   # last time level >= open_th
     last_beep_time = 0.0
-    # Audio level threshold; tune as needed
-    level_threshold = 1000
 
     while True:
         with _proc_lock:
@@ -351,32 +414,42 @@ def _pipe_audio_loop():
         if not chunk:
             break
 
-        # Compute a crude level (max abs sample)
+        # Compute a crude max-abs level over this chunk
         level = 0
         try:
-            for (sample,) in struct.iter_unpack("<h", chunk):
-                if sample < 0:
-                    sample = -sample
-                if sample > level:
-                    level = sample
+            for (s,) in struct.iter_unpack("<h", chunk):
+                if s < 0:
+                    s = -s
+                if s > level:
+                    level = s
         except Exception:
             level = 0
 
         now = time.time()
-        if level > level_threshold:
-            if not squelch_open and now - last_beep_time > 1.0:
-                # New squelch open -> inject a short beep before audio
-                try:
-                    aplay.stdin.write(_BEEP_CHUNK)
-                    aplay.stdin.flush()
-                except Exception:
-                    pass
-                squelch_open = True
-                last_beep_time = now
-        else:
-            squelch_open = False
 
-        # Forward the actual audio
+        # --- squelch / beep logic ---
+
+        if level >= open_th:
+            # strong audio present
+            if not squelch_open:
+                # we're crossing from closed -> open
+                if now - last_beep_time >= MIN_BEEP_INTERVAL:
+                    try:
+                        aplay.stdin.write(beep_chunk)
+                        aplay.stdin.flush()
+                    except Exception:
+                        pass
+                    last_beep_time = now
+            squelch_open = True
+            last_strong_time = now
+
+        elif level <= close_th:
+            # weak/quiet: only close squelch if we've been quiet long enough
+            if squelch_open and (now - last_strong_time) >= HANG_SEC:
+                squelch_open = False
+
+        # --- forward the actual audio to aplay ---
+
         try:
             aplay.stdin.write(chunk)
             aplay.stdin.flush()
@@ -387,6 +460,8 @@ def _pipe_audio_loop():
         _pipe_thread = None
 
 
+
+
 @app.route("/api/start", methods=["POST"])
 def api_start():
     global _rtl_proc, _aplay_proc, _pipe_thread, _last_start
@@ -394,8 +469,11 @@ def api_start():
     data = request.get_json() or {}
 
     # Update state from payload
-    for key in ("freq", "bandwidth", "gain", "samplerate",
-                "audio_device", "device_index", "squelch"):
+    for key in (
+        "freq", "bandwidth", "gain", "samplerate",
+        "audio_device", "device_index", "squelch",
+        "open_threshold", "close_threshold", "beep_freq",
+    ):
         if key in data:
             if isinstance(state[key], float):
                 state[key] = float(data[key])
@@ -434,7 +512,6 @@ def api_start():
                 stderr=subprocess.PIPE,
             )
         except Exception as e:
-            # If aplay fails, stop rtl_fm too
             try:
                 _rtl_proc.send_signal(signal.SIGINT)
             except Exception:
@@ -478,7 +555,6 @@ def api_stop():
 
 @app.route("/api/logs")
 def api_logs():
-    # Return some stderr from both processes
     with _proc_lock:
         if _rtl_proc is None and _aplay_proc is None:
             return jsonify({"ok": False, "reason": "not running"}), 400
