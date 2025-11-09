@@ -4,6 +4,8 @@ import signal
 import subprocess
 import threading
 import time
+import math
+import struct
 
 from flask import Flask, jsonify, request, render_template_string
 
@@ -12,20 +14,33 @@ app = Flask(__name__)
 # Global processes + lock
 _rtl_proc = None
 _aplay_proc = None
+_pipe_thread = None
 _proc_lock = threading.Lock()
 _last_start = None
 
 # Current settings / state
 state = {
     "running": False,
-    "freq": 100.1e6,         # Hz
-    "bandwidth": 50e3,      # Hz (used to pick rtl_fm -s)
+    "freq": 453.45e6,        # Hz, just some default
+    "bandwidth": 50e3,       # Hz, good for ~25 kHz FM channels
     "gain": 0,               # 0 = auto
     "samplerate": 48000,     # audio sample rate for aplay
     "audio_device": "plughw:2,0",  # Pi headphones jack (card 2, device 0)
     "volume": 80,            # percent (amixer)
     "device_index": 0,       # which RTL-SDR: 0, 1, ...
+    "squelch": 20,           # rtl_fm -l value (0=off)
 }
+
+def make_beep(sr=48000, freq=1000, duration=0.06, volume=0.4):
+    """Generate a short S16_LE mono beep."""
+    n_samples = int(sr * duration)
+    frames = []
+    for n in range(n_samples):
+        sample = int(volume * 32767 * math.sin(2 * math.pi * freq * n / sr))
+        frames.append(struct.pack("<h", sample))
+    return b"".join(frames)
+
+_BEEP_CHUNK = make_beep()
 
 HTML = """<!doctype html>
 <html>
@@ -46,16 +61,19 @@ pre { background:#111; color:#eee; padding:8px; max-height:200px; overflow:auto;
 <h2>RTL-FM Controller</h2>
 
 <label>Frequency (MHz)
-  <input id="freq" type="number" step="0.001" value="100.100">
+  <input id="freq" type="number" step="0.001" value="453.450">
 </label>
 <label>Bandwidth (kHz)
-  <input id="bandwidth" type="number" step="1" value="200">
+  <input id="bandwidth" type="number" step="1" value="50">
 </label>
 <label>Gain (0=auto)
   <input id="gain" type="number" step="1" value="0">
 </label>
 <label>SDR Index (-d)
   <input id="device_index" type="number" step="1" value="0">
+</label>
+<label>Squelch (-l, 0 = off)
+  <input id="squelch" type="number" step="1" value="20">
 </label>
 <label>Audio Device
   <input id="audio_device" type="text" value="plughw:2,0">
@@ -90,6 +108,7 @@ const freqInput   = document.getElementById('freq');
 const bwInput     = document.getElementById('bandwidth');
 const gainInput   = document.getElementById('gain');
 const devIdxInput = document.getElementById('device_index');
+const sqlInput    = document.getElementById('squelch');
 const devInput    = document.getElementById('audio_device');
 const volInput    = document.getElementById('volume');
 const volLabel    = document.getElementById('volumeVal');
@@ -104,9 +123,12 @@ async function refresh(){
        <b>Freq:</b> ${(s.freq/1e6).toFixed(3)} MHz<br>
        <b>Bandwidth:</b> ${(s.bandwidth/1e3)} kHz<br>
        <b>Gain:</b> ${s.gain}<br>
+       <b>Squelch (-l):</b> ${s.squelch}<br>
        <b>SDR index (-d):</b> ${s.device_index}<br>
        <b>Audio:</b> ${s.audio_device}<br>
        <b>Volume:</b> ${s.volume}%<br>
+       <b>PID rtl_fm:</b> ${s.pid_rtl || '-'}<br>
+       <b>PID aplay:</b> ${s.pid_aplay || '-'}<br>
        <b>Last start:</b> ${s.last_start ? new Date(s.last_start*1000).toLocaleString() : '-'}`;
 
     if (document.activeElement !== freqInput)
@@ -117,6 +139,8 @@ async function refresh(){
       gainInput.value = s.gain;
     if (document.activeElement !== devIdxInput)
       devIdxInput.value = s.device_index;
+    if (document.activeElement !== sqlInput)
+      sqlInput.value = s.squelch;
     if (document.activeElement !== devInput)
       devInput.value = s.audio_device;
     if (document.activeElement !== volInput) {
@@ -134,6 +158,7 @@ document.getElementById('start').onclick = async () => {
     bandwidth: parseFloat(bwInput.value) * 1e3,
     gain: parseInt(gainInput.value),
     device_index: parseInt(devIdxInput.value),
+    squelch: parseInt(sqlInput.value),
     audio_device: devInput.value
   };
   try {
@@ -223,10 +248,12 @@ def set_volume(percent: int):
 def build_rtl_cmd():
     """Build rtl_fm command as a list for subprocess (no shell)."""
     freq_hz = int(state["freq"])
-    bw_hz = int(state["bandwidth"]) if state["bandwidth"] else 200000
+    bw_hz = int(state["bandwidth"]) if state["bandwidth"] else 50000
     gain = int(state["gain"])
+    squelch = int(state.get("squelch", 0))
 
     rtl_s = max(24000, min(192000, bw_hz))
+
     cmd = [
         "rtl_fm",
         "-d", str(int(state["device_index"])),
@@ -239,6 +266,8 @@ def build_rtl_cmd():
         cmd += ["-g", str(gain)]
     else:
         cmd += ["-g", "0"]
+    if squelch > 0:
+        cmd += ["-l", str(squelch)]
     return cmd
 
 
@@ -256,8 +285,9 @@ def build_aplay_cmd():
 
 def _stop_current_locked():
     """Stop current rtl_fm + aplay; caller must hold _proc_lock."""
-    global _rtl_proc, _aplay_proc
-    # Stop rtl_fm gently first
+    global _rtl_proc, _aplay_proc, _pipe_thread
+
+    # Stop the pipe thread by killing procs; thread will exit on EOF/pipe error.
     if _rtl_proc is not None and _rtl_proc.poll() is None:
         try:
             _rtl_proc.send_signal(signal.SIGINT)
@@ -275,7 +305,6 @@ def _stop_current_locked():
                 pass
     _rtl_proc = None
 
-    # Then stop aplay
     if _aplay_proc is not None and _aplay_proc.poll() is None:
         try:
             _aplay_proc.terminate()
@@ -290,17 +319,83 @@ def _stop_current_locked():
                 pass
     _aplay_proc = None
 
+    _pipe_thread = None
     state["running"] = False
+
+
+def _pipe_audio_loop():
+    """
+    Forward PCM from rtl_fm -> aplay and detect squelch-open events
+    to inject a short beep once per open.
+    """
+    global _pipe_thread
+
+    squelch_open = False
+    last_beep_time = 0.0
+    # Audio level threshold; tune as needed
+    level_threshold = 1000
+
+    while True:
+        with _proc_lock:
+            rtl = _rtl_proc
+            aplay = _aplay_proc
+
+        if rtl is None or aplay is None:
+            break
+
+        try:
+            chunk = rtl.stdout.read(4096)
+        except Exception:
+            break
+
+        if not chunk:
+            break
+
+        # Compute a crude level (max abs sample)
+        level = 0
+        try:
+            for (sample,) in struct.iter_unpack("<h", chunk):
+                if sample < 0:
+                    sample = -sample
+                if sample > level:
+                    level = sample
+        except Exception:
+            level = 0
+
+        now = time.time()
+        if level > level_threshold:
+            if not squelch_open and now - last_beep_time > 1.0:
+                # New squelch open -> inject a short beep before audio
+                try:
+                    aplay.stdin.write(_BEEP_CHUNK)
+                    aplay.stdin.flush()
+                except Exception:
+                    pass
+                squelch_open = True
+                last_beep_time = now
+        else:
+            squelch_open = False
+
+        # Forward the actual audio
+        try:
+            aplay.stdin.write(chunk)
+            aplay.stdin.flush()
+        except Exception:
+            break
+
+    with _proc_lock:
+        _pipe_thread = None
 
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
-    global _rtl_proc, _aplay_proc, _last_start
+    global _rtl_proc, _aplay_proc, _pipe_thread, _last_start
 
     data = request.get_json() or {}
 
     # Update state from payload
-    for key in ("freq", "bandwidth", "gain", "samplerate", "audio_device", "device_index"):
+    for key in ("freq", "bandwidth", "gain", "samplerate",
+                "audio_device", "device_index", "squelch"):
         if key in data:
             if isinstance(state[key], float):
                 state[key] = float(data[key])
@@ -330,11 +425,11 @@ def api_start():
             _rtl_proc = None
             return jsonify({"ok": False, "error": f"failed to start rtl_fm: {e}"}), 500
 
-        # Then start aplay, consuming rtl_fm's stdout
+        # Then start aplay, consuming PCM from us (thread)
         try:
             _aplay_proc = subprocess.Popen(
                 aplay_cmd,
-                stdin=_rtl_proc.stdout,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -351,11 +446,20 @@ def api_start():
             _aplay_proc = None
             return jsonify({"ok": False, "error": f"failed to start aplay: {e}"}), 500
 
+        # Start audio pipe thread
+        _pipe_thread = threading.Thread(target=_pipe_audio_loop, daemon=True)
+        _pipe_thread.start()
+
         _last_start = time.time()
         state["running"] = True
 
-    return jsonify({"ok": True, "rtl_cmd": rtl_cmd, "aplay_cmd": aplay_cmd,
-                    "pid_rtl": _rtl_proc.pid, "pid_aplay": _aplay_proc.pid})
+    return jsonify({
+        "ok": True,
+        "rtl_cmd": rtl_cmd,
+        "aplay_cmd": aplay_cmd,
+        "pid_rtl": _rtl_proc.pid,
+        "pid_aplay": _aplay_proc.pid,
+    })
 
 
 @app.route("/api/stop", methods=["POST"])
