@@ -15,9 +15,9 @@ HUB_URL = os.getenv("HUB_URL", "http://hub:8080")
 HUB_HOST = os.getenv("HUB_HOST", "hub")
 FFT_PORT = int(os.getenv("FFT_PORT", "8090"))
 
-FFT_SIZE = 1024           # internal FFT size, was 2048
-DOWNSAMPLED_BINS = 256     # bins sent to browser, was 512
-IDLE_TIMEOUT = 30.0        # seconds without viewer activity => disconnect IQ
+FFT_SIZE = 2048            # internal FFT size
+DOWNSAMPLED_BINS = 512     # bins sent to browser
+IDLE_TIMEOUT = 30.0        # seconds without browser polls => disconnect IQ
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -40,10 +40,13 @@ def find_sdr(serial):
 
 
 def send_control(serial, freq=None, samp_rate=None, gain=None):
-    print(f"[fft] send_control: serial={serial} freq={freq} sr={samp_rate} gain={gain}", flush=True)
+    print("[fft] send_control: serial={} freq={} sr={} gain={}".format(
+        serial, freq, samp_rate, gain
+    ), flush=True)
+
     dev = find_sdr(serial)
     if not dev:
-        print(f"[fft] send_control: not_found for serial={serial}", flush=True)
+        print(f"[fft] send_control: device not found for serial={serial}", flush=True)
         return {"ok": False, "error": "not_found"}
 
     ctl_port = dev.get("control_port")
@@ -124,7 +127,7 @@ def stream_worker(state: StreamState):
         now = time.time()
         idle = now - state.last_access
 
-        # If nobody has hit the viewer for a while, close IQ and idle.
+        # If nobody has hit websocket/FFT for a while, close IQ and idle.
         if idle > IDLE_TIMEOUT:
             if sock is not None:
                 try:
@@ -132,7 +135,7 @@ def stream_worker(state: StreamState):
                 except Exception:
                     pass
                 sock = None
-            time.sleep(0.5)
+            time.sleep(1.0)
             continue
 
         # Make sure we know where this SDR's IQ port is.
@@ -163,9 +166,9 @@ def stream_worker(state: StreamState):
             try:
                 sock = socket.create_connection((HUB_HOST, iq_port), timeout=5)
                 sock.settimeout(1.0)
-                print(f"[fft] stream_worker: connected to IQ for serial={state.serial} port={iq_port}", flush=True)
                 with state.lock:
                     state.last_error = None
+                print(f"[fft] stream_worker: connected to IQ for serial={state.serial} port={iq_port}", flush=True)
             except Exception as e:
                 with state.lock:
                     state.last_error = f"iq_connect_failed: {e}"
@@ -175,12 +178,16 @@ def stream_worker(state: StreamState):
 
         # Read IQ and compute FFT
         try:
-            data = sock.recv(4096)
+            # Larger read -> smoother stream
+            data = sock.recv(16384)
             if not data:
                 # server closed; reconnect next loop
-                sock.close()
+                try:
+                    sock.close()
+                except Exception:
+                    pass
                 sock = None
-                time.sleep(0.2)
+                time.sleep(1.0)
                 continue
         except socket.timeout:
             # Just try again
@@ -193,7 +200,7 @@ def stream_worker(state: StreamState):
             except Exception:
                 pass
             sock = None
-            time.sleep(0.5)
+            time.sleep(1.0)
             continue
 
         # rtl_tcp default: unsigned 8-bit interleaved I/Q
@@ -201,7 +208,7 @@ def stream_worker(state: StreamState):
         if arr.size < 2 * FFT_SIZE:
             continue
 
-        arr = arr[-2 * FFT_SIZE :]
+        arr = arr[-2 * FFT_SIZE:]
         i = arr[0::2].astype(np.float32) - 127.5
         q = arr[1::2].astype(np.float32) - 127.5
         samples = i + 1j * q
@@ -216,18 +223,18 @@ def stream_worker(state: StreamState):
             psd_resampled = psd
 
         with state.lock:
-            state.latest_bins = psd_resampled.tolist()
+            state.latest_bins = psd_resampled.astype(float).tolist()
             # last_error stays as-is if None / cleared earlier
 
 
-# --------- WebSocket FFT endpoint (Flask-Sock) ---------
+# --------- WebSocket FFT endpoint (binary Float32) ---------
 
 
 @sock.route("/ws/fft/<serial>")
 def ws_fft(ws, serial):
     """
     WebSocket: push FFT bins for this SDR at a steady rate.
-    Uses the same StreamState / stream_worker as the HTTP polling path.
+    Frames are raw binary Float32Array (little-endian) with DOWNSAMPLED_BINS elements.
     """
     print(f"[fft] WebSocket client connected for serial={serial}", flush=True)
     state = ensure_stream(serial)
@@ -238,26 +245,27 @@ def ws_fft(ws, serial):
 
             with state.lock:
                 bins = list(state.latest_bins)
-                err = state.last_error
 
             if not bins:
-                msg = {"ok": False, "serial": serial, "error": err or "no_data_yet"}
-            else:
-                msg = {"ok": True, "serial": serial, "bins": bins, "error": err}
+                # No data yet; don't spam empty frames
+                time.sleep(0.05)
+                continue
 
-            ws.send(json.dumps(msg))
-            # ~20 Hz
-            # time.sleep(0.05) 
-            time.sleep(0.02) #was .05
-    except Exception as e:
-        # Any send/connection error ends up here – treat it as a normal close.
-        print(f"[fft] WebSocket closed for serial={serial}: {e}", flush=True)
+            # Convert to float32 bytes
+            arr = np.asarray(bins, dtype=np.float32)
+            try:
+                ws.send(arr.tobytes())
+            except Exception as e:
+                print(f"[fft] WebSocket send error for serial={serial}: {e}", flush=True)
+                break
+
+            # ~20 Hz is .05
+            time.sleep(0.01) 
     finally:
         print(f"[fft] WebSocket handler exit for serial={serial}", flush=True)
 
 
-
-# --------- HTTP API (SDR list, config, optional FFT fallback) ---------
+# --------- HTTP API endpoints (still here for control / debug) ---------
 
 
 @app.get("/api/sdrs")
@@ -280,11 +288,9 @@ def api_config_sdr(serial):
     return jsonify(resp), status
 
 
+# Optional: keep old HTTP FFT endpoint for debugging if you want
 @app.get("/api/fft/<serial>")
 def api_fft(serial):
-    """
-    Optional HTTP polling FFT endpoint (not used by the WS UI, but handy for debugging).
-    """
     state = ensure_stream(serial)
     state.last_access = time.time()
 
@@ -295,18 +301,10 @@ def api_fft(serial):
     if not bins:
         return jsonify({"ok": False, "error": err or "no_data_yet"}), 200
 
-    return jsonify(
-        {
-            "ok": True,
-            "serial": serial,
-            "bins": bins,
-            "error": err,
-        }
-    )
+    return jsonify({"ok": True, "serial": serial, "bins": bins, "error": err})
 
 
-# --------- Web UI (FFT + Waterfall) ---------
-
+# --------- Web UI (FFT + Waterfall using WebSocket + Float32Array) ---------
 
 @app.route("/")
 def index():
@@ -372,6 +370,10 @@ button:hover { background: #4b5563; }
   width: 90px;
 }
 .panel-header label { font-size: 11px; color: #9ca3af; }
+.panel-meta {
+  font-size: 11px;
+  color: #9ca3af;
+}
 .canvas-wrap {
   display: flex;
   flex-direction: column;
@@ -414,13 +416,42 @@ let sdrList = [];
 let panelIdCounter = 0;
 const panels = new Map(); // id -> panel object
 
+function getSdrMeta(serial) {
+  return sdrList.find(s => s.serial === serial) || null;
+}
+
 async function loadSDRs() {
   try {
     const res = await fetch("/api/sdrs");
     if (!res.ok) return;
     sdrList = await res.json();
-    panels.forEach(p => p.refreshSDRSelect());
+    panels.forEach(p => {
+      p.refreshSDRSelect();
+      p.updateMetaDisplay();
+    });
   } catch(e) {}
+}
+
+function formatFreqLabel(hz) {
+  if (!hz && hz !== 0) return "";
+  if (Math.abs(hz) >= 1e9) return (hz / 1e9).toFixed(3);
+  return (hz / 1e6).toFixed(3) ;
+}
+
+function chooseTickStep(spanHz) {
+  const candidates = [1e4, 2e4, 5e4, 1e5, 2e5, 5e5, 1e6, 2e6, 5e6];
+  const targetTicks = 8;
+  let best = candidates[0];
+  let bestDiff = Infinity;
+  candidates.forEach(step => {
+    const n = spanHz / step;
+    const diff = Math.abs(n - targetTicks);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = step;
+    }
+  });
+  return best;
 }
 
 class FFTPanel {
@@ -428,6 +459,10 @@ class FFTPanel {
     this.id = id;
     this.serial = null;
     this.ws = null;
+
+    this.centerFreqHz = null;
+    this.sampleRateHz = null;
+    this.gainDb = null;
 
     this.root = document.createElement("div");
     this.root.className = "panel";
@@ -471,6 +506,10 @@ class FFTPanel {
     this.header.appendChild(applyBtn);
     this.header.appendChild(closeBtn);
 
+    this.meta = document.createElement("div");
+    this.meta.className = "panel-meta";
+    this.meta.textContent = "";
+
     this.status = document.createElement("div");
     this.status.className = "status-text";
     this.status.textContent = "Idle";
@@ -496,6 +535,7 @@ class FFTPanel {
     this.canvasWrap.appendChild(this.waterCanvas);
 
     this.root.appendChild(this.header);
+    this.root.appendChild(this.meta);
     this.root.appendChild(this.status);
     this.root.appendChild(this.canvasWrap);
     document.getElementById("panels").appendChild(this.root);
@@ -516,56 +556,74 @@ class FFTPanel {
     });
   }
 
+  updateMetaDisplay() {
+    if (!this.serial) {
+      this.meta.textContent = "";
+      this.centerFreqHz = null;
+      this.sampleRateHz = null;
+      this.gainDb = null;
+      return;
+    }
+    const meta = getSdrMeta(this.serial);
+    if (!meta) {
+      this.meta.textContent = "";
+      return;
+    }
+    this.centerFreqHz = meta.center_freq || null;
+    // fallback to rtl_tcp default if sample_rate missing
+    this.sampleRateHz = meta.sample_rate || 2048000;
+    this.gainDb = (meta.gain === null || meta.gain === undefined) ? null : meta.gain;
+
+    const cfStr = this.centerFreqHz ? formatFreqLabel(this.centerFreqHz) : "Freq: -";
+    const srStr = this.sampleRateHz ? (this.sampleRateHz/1e6).toFixed(3) + " Msps" : "Rate: -";
+    const gStr = (this.gainDb === null) ? "Gain: auto" : `Gain: ${this.gainDb} dB`;
+
+    this.meta.textContent = `${cfStr} | ${srStr} | ${gStr}`;
+  }
+
   setSerial(serial) {
     if (serial === this.serial) return;
-    this.serial = serial || null;
     this.closeWS();
+    this.serial = serial || null;
     if (this.serial) {
       this.status.textContent = `Viewing ${this.serial}`;
-      this.openWS();
+      this.updateMetaDisplay();
+      this.connectWS();
     } else {
       this.status.textContent = "Idle";
+      this.updateMetaDisplay();
       this.drawEmpty();
     }
   }
 
-  openWS() {
+  connectWS() {
     if (!this.serial) return;
-    const loc = window.location;
-    const proto = loc.protocol === "https:" ? "wss" : "ws";
-    const url = `${proto}://${loc.host}/ws/fft/${encodeURIComponent(this.serial)}`;
+    const proto = (location.protocol === "https:") ? "wss" : "ws";
+    const url = `${proto}://${location.host}/ws/fft/${encodeURIComponent(this.serial)}`;
     const ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
     this.ws = ws;
 
     ws.onopen = () => {
-      this.status.textContent = `Viewing ${this.serial} (live)`;
+      this.status.textContent = `Viewing ${this.serial}`;
     };
-
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (!data.ok || !data.bins) {
-          if (data.error) {
-            this.status.textContent = `Error: ${data.error}`;
-          }
-          return;
-        }
-        this.status.textContent = `Viewing ${this.serial} (live)`;
-        this.drawSpectrum(data.bins);
-        this.drawWaterfall(data.bins);
-      } catch (e) {
-        this.status.textContent = "Error parsing data";
-      }
+    ws.onmessage = (evt) => {
+      const buf = evt.data;
+      if (!(buf instanceof ArrayBuffer)) return;
+      const arr = new Float32Array(buf);
+      if (!arr.length) return;
+      const bins = Array.from(arr);
+      this.drawSpectrum(bins);
+      this.drawWaterfall(bins);
     };
-
     ws.onerror = () => {
       this.status.textContent = "WebSocket error";
     };
-
     ws.onclose = () => {
-      if (this.serial) {
-        this.status.textContent = "WebSocket closed";
+      if (this.ws === ws) {
+        this.ws = null;
       }
+      // leave last frame on screen; status will update on next user action
     };
   }
 
@@ -591,6 +649,9 @@ class FFTPanel {
       headers: {"Content-Type":"application/json"},
       body: JSON.stringify(payload),
     });
+
+    // Refresh SDR metadata from hub after a short delay
+    setTimeout(loadSDRs, 300);
   }
 
   drawEmpty() {
@@ -627,19 +688,54 @@ class FFTPanel {
     const maxVal = Math.max(...bins);
     const span = maxVal - minVal || 1;
 
+    // Draw line trace
     ctx.strokeStyle = "#60a5fa";
     ctx.beginPath();
     bins.forEach((v, i) => {
       const x = (i / (bins.length - 1)) * w;
       const norm = (v - minVal) / span;
-      const y = h - norm * (h - 10) - 5;
+      const y = h - norm * (h - 20) - 10;
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     });
     ctx.stroke();
+
+    // Frequency graduations (x-axis)
+    if (this.centerFreqHz && this.sampleRateHz) {
+      const bw = this.sampleRateHz;
+      const fStart = this.centerFreqHz - bw / 2;
+      const fEnd   = this.centerFreqHz + bw / 2;
+      const spanHz = fEnd - fStart;
+      const step = chooseTickStep(spanHz);
+
+      ctx.strokeStyle = "#1f2937";
+      ctx.fillStyle = "#6b7280";
+      ctx.font = "10px system-ui";
+
+      const firstTick = Math.ceil(fStart / step) * step;
+      for (let f = firstTick; f <= fEnd; f += step) {
+        const x = (f - fStart) / spanHz * w;
+        // tick mark
+        ctx.beginPath();
+        ctx.moveTo(x, h);
+        ctx.lineTo(x, h - 6);
+        ctx.stroke();
+
+        const label = formatFreqLabel(f);
+        ctx.fillText(label, x + 2, h - 2);
+      }
+
+      // Center marker
+      const cx = w / 2;
+      ctx.strokeStyle = "#4b5563";
+      ctx.beginPath();
+      ctx.moveTo(cx, 0);
+      ctx.lineTo(cx, 10);
+      ctx.stroke();
+    }
   }
 
-  drawWaterfall(bins) {
+    drawWaterfall(bins) {
     const ctx = this.waterCtx;
     const w = this.waterCanvas.width;
     const h = this.waterCanvas.height;
@@ -650,11 +746,12 @@ class FFTPanel {
     const maxVal = Math.max(...bins);
     const span = maxVal - minVal || 1;
 
-    // Scroll existing image up by 1 pixel
-    ctx.drawImage(this.waterCanvas, 0, -1);
+    // Scroll existing image *down* by 1 pixel
+    // (older data moves toward the bottom)
+    ctx.drawImage(this.waterCanvas, 0, 1);
 
-    // Draw new row at bottom
-    const img = ctx.getImageData(0, h - 1, w, 1);
+    // Draw new row at the *top* (y = 0)
+    const img = ctx.getImageData(0, 0, w, 1);
     const data = img.data;
 
     for (let x = 0; x < w; x++) {
@@ -673,8 +770,9 @@ class FFTPanel {
       data[i4 + 3] = 255;
     }
 
-    ctx.putImageData(img, 0, h - 1);
+    ctx.putImageData(img, 0, 0);
   }
+
 
   destroy() {
     this.closeWS();
@@ -699,5 +797,5 @@ setInterval(loadSDRs, 5000);
 
 
 if __name__ == "__main__":
-    # Flask dev server; works fine for this internal tool and supports Flask-Sock websockets
+    # Flask dev server; Dockerfile uses this
     app.run(host="0.0.0.0", port=FFT_PORT, threaded=True)

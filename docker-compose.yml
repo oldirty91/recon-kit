@@ -35,3 +35,29 @@ services:
       - hub
     ports:
       - "8090:8090"
+
+  demod:
+    build:
+      context: ./tools/demod
+    container_name: recon-demod
+    environment:
+      - HUB_URL=http://hub:8080
+      - HUB_HOST=hub
+      - DEMOD_PORT=8100
+    depends_on:
+      - hub
+    ports:
+      - "8100:8100"
+
+  rtlfm:
+    build:
+      context: ./tools/rtlfm
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    network_mode: "host"
+    privileged: true                 # needed to reset USB ports
+    devices:
+      - "/dev/bus/usb:/dev/bus/usb"
+      - "/dev/snd:/dev/snd"
+    volumes:
+      - "/sys/bus/usb:/sys/bus/usb"

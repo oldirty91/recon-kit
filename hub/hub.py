@@ -20,6 +20,10 @@ CTL_BASE_PORT = int(os.getenv("CTL_BASE_PORT", "6000"))
 MAX_SDRS = int(os.getenv("MAX_SDRS", "8"))
 THROUGHPUT_INTERVAL_SEC = 2.0  # rolling window for throughput
 
+# Max backlog per relay client (bytes). If they fall behind more than this,
+# we keep only the newest data in their backlog.
+MAX_PENDING_PER_CLIENT = 1 * 1024 * 1024  # 1 MB
+
 app = Flask(__name__)
 sdrs: Dict[str, "SDRDevice"] = {}
 
@@ -48,6 +52,8 @@ class SDRDevice:
         # IQ relay state (fan-out to multiple tool clients)
         self.relay_clients = set()
         self.relay_lock = threading.Lock()
+        # Per-client unsent backlog (non-blocking fan-out)
+        self.relay_pending = {}
 
         # Underlying rtl_tcp stream socket (hub -> rtl_tcp)
         self.stream_sock: Optional[socket.socket] = None
@@ -267,6 +273,11 @@ def iq_relay_accept_loop(dev: SDRDevice):
     """
     Accept multiple tool clients on dev.iq_port and register them as consumers
     of the IQ stream. The hub will read from rtl_tcp once and broadcast to all.
+
+    IMPORTANT:
+      - client sockets are non-blocking
+      - per-client backlog is stored in dev.relay_pending
+      - slow clients will skip some chunks but will not stall rtl_tcp
     """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -279,10 +290,15 @@ def iq_relay_accept_loop(dev: SDRDevice):
         while True:
             try:
                 client, addr = srv.accept()
-                client.setblocking(True)  # keep it simple; fan-out will handle slow clients
+                # Make this client non-blocking so send() never stalls
+                client.setblocking(False)
+                # Optional: reduce latency
+                client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
                 print(f"[hub] {dev.serial} relay: client connected from {addr}")
                 with dev.relay_lock:
                     dev.relay_clients.add(client)
+                    dev.relay_pending[client] = b""
             except socket.timeout:
                 continue
             except Exception as e:
@@ -297,14 +313,18 @@ def iq_relay_accept_loop(dev: SDRDevice):
                 except Exception:
                     pass
             dev.relay_clients.clear()
+            dev.relay_pending.clear()
 
 
 def iq_relay_reader_loop(dev: SDRDevice):
     """
     Maintain a single connection to rtl_tcp on dev.rtl_port and broadcast IQ
-    data to all connected clients on dev.iq_port.
-    Also keeps dev.stream_sock pointing at the active socket so we can send
-    rtl_tcp control commands without restart.
+    data to all connected clients on dev.iq_port, without letting slow clients
+    stall rtl_tcp.
+
+    - rtl_tcp socket is blocking, but we always drain it as fast as we can.
+    - relay clients are non-blocking; unsent bytes are stored in dev.relay_pending.
+    - if a client's backlog exceeds MAX_PENDING_PER_CLIENT, keep only the newest bytes.
     """
     rtl_sock = None
 
@@ -347,7 +367,7 @@ def iq_relay_reader_loop(dev: SDRDevice):
                 time.sleep(2.0)
                 continue
 
-        # Read IQ and broadcast
+        # Read IQ from rtl_tcp
         try:
             data = rtl_sock.recv(4096)
             if not data:
@@ -395,17 +415,40 @@ def iq_relay_reader_loop(dev: SDRDevice):
                 dev._bytes_window = 0
                 dev._last_throughput_ts = now
 
-        # Fan-out to connected clients
-        to_drop = []
+        # Fan-out to connected clients (non-blocking)
         with dev.relay_lock:
+            if not dev.relay_clients:
+                continue
+
+            to_drop = []
+
             for c in list(dev.relay_clients):
+                backlog = dev.relay_pending.get(c, b"") + data
+
+                # Clamp backlog per client so they can't explode RAM
+                if len(backlog) > MAX_PENDING_PER_CLIENT:
+                    # Keep only the newest data
+                    backlog = backlog[-MAX_PENDING_PER_CLIENT:]
+
                 try:
-                    c.sendall(data)
-                except Exception:
+                    if backlog:
+                        # Non-blocking socket: may send partial data
+                        sent = c.send(backlog)
+                        if sent < len(backlog):
+                            backlog = backlog[sent:]
+                        else:
+                            backlog = b""
+                    dev.relay_pending[c] = backlog
+                except (BlockingIOError, InterruptedError):
+                    # Can't send right now; keep backlog as-is
+                    dev.relay_pending[c] = backlog
+                except Exception as e:
+                    print(f"[hub] {dev.serial} relay: dropping client {c.fileno()} due to error: {e}")
                     to_drop.append(c)
+
             for c in to_drop:
-                print(f"[hub] {dev.serial} relay: dropping client")
                 dev.relay_clients.discard(c)
+                dev.relay_pending.pop(c, None)
                 try:
                     c.close()
                 except Exception:
