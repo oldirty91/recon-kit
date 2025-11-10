@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import os
 import signal
 import subprocess
 import threading
@@ -29,11 +28,22 @@ state = {
     "volume": 80,            # percent (amixer)
     "device_index": 0,       # which RTL-SDR: 0, 1, ...
     "squelch": 20,           # rtl_fm -l value (0=off)
+    # Modulation (-M)
+    "modulation": "fm",      # fm, wbfm, raw, am, usb, lsb
     # Beep / detection config
     "open_threshold": 2000,  # audio level needed to consider "open"
-    "close_threshold": 250, # level below which we consider "closed" again
+    "close_threshold": 250,  # level below which we consider "closed" again
     "beep_freq": 1000,       # Hz, tone for this SDR
+    # rtl_fm built-in scan config
+    "scan_enabled": False,
+    "scan_start": 453.0e6,   # Hz
+    "scan_end": 454.0e6,     # Hz
+    "scan_step": 25e3,       # Hz
+    # Debug: last commands
+    "last_rtl_cmd": [],
+    "last_aplay_cmd": [],
 }
+
 
 def make_beep(sr=48000, freq=1000, duration=0.06, volume=0.4):
     """
@@ -46,21 +56,22 @@ def make_beep(sr=48000, freq=1000, duration=0.06, volume=0.4):
         frames.append(struct.pack("<h", sample))
     return b"".join(frames)
 
+
 HTML = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8" />
 <title>RTL-FM Controller</title>
 <style>
-body { font-family: system-ui, sans-serif; padding: 20px; max-width: 750px; }
+body { font-family: system-ui, sans-serif; padding: 20px; max-width: 1000px; }
 label { display:block; margin-top:8px; }
-input[type="number"], input[type="text"] { width: 220px; padding:5px; }
+input[type="number"], input[type="text"], select { width: 220px; padding:5px; }
 button { margin-top:10px; padding:6px 10px; }
 pre { background:#111; color:#eee; padding:8px; max-height:200px; overflow:auto; }
 .status { margin-top: 12px; border: 1px solid #ccc; border-radius:5px; padding:8px; }
 .range-row { display:flex; align-items:center; gap:10px; margin-top:8px; }
 .inline { display:flex; gap:16px; flex-wrap:wrap; }
-.inline > div { min-width: 220px; }
+.inline > div { min-width: 260px; }
 small { color:#555; }
 </style>
 </head>
@@ -69,11 +80,22 @@ small { color:#555; }
 
 <div class="inline">
   <div>
+    <h3>Receiver</h3>
     <label>Frequency (MHz)
       <input id="freq" type="number" step="0.001" value="453.450">
     </label>
     <label>Bandwidth (kHz)
       <input id="bandwidth" type="number" step="1" value="50">
+    </label>
+    <label>Modulation (-M)
+      <select id="modulation">
+        <option value="fm">fm (NBFM)</option>
+        <option value="wbfm">wbfm (WBFM)</option>
+        <option value="raw">raw (IQ / raw)</option>
+        <option value="am">am</option>
+        <option value="usb">usb</option>
+        <option value="lsb">lsb</option>
+      </select>
     </label>
     <label>Gain (0=auto)
       <input id="gain" type="number" step="1" value="0">
@@ -90,6 +112,7 @@ small { color:#555; }
   </div>
 
   <div>
+    <h3>Audio / Beep</h3>
     <div class="range-row">
       <label style="margin-top:0;">Volume (%)</label>
       <input id="volume" type="range" min="0" max="100" value="80">
@@ -100,12 +123,30 @@ small { color:#555; }
     </label>
     <small>Use different beep frequencies on each SDR (e.g. 800 Hz vs 1500 Hz)</small>
     <label>Open threshold (audio level)
-      <input id="open_threshold" type="number" step="100" value="3000">
+      <input id="open_threshold" type="number" step="100" value="2000">
     </label>
     <label>Close threshold (audio level)
-      <input id="close_threshold" type="number" step="100" value="1500">
+      <input id="close_threshold" type="number" step="50" value="250">
     </label>
     <small>Set close threshold &lt; open threshold to avoid chattering.</small>
+  </div>
+
+  <div>
+    <h3>Scan (rtl_fm built-in)</h3>
+    <label>Scan start (MHz)
+      <input id="scan_start" type="number" step="0.001" value="453.000">
+    </label>
+    <label>Scan end (MHz)
+      <input id="scan_end" type="number" step="0.001" value="454.000">
+    </label>
+    <label>Scan step (kHz)
+      <input id="scan_step" type="number" step="1" value="25">
+    </label>
+    <label>
+      <input id="scan_enabled" type="checkbox">
+      Enable scan (rtl_fm -f start:end:step)
+    </label>
+    <small>Changes take effect when you click Start / Retune.</small>
   </div>
 </div>
 
@@ -128,27 +169,34 @@ function j(url, m='GET', b=null){
   }).then(r => r.json());
 }
 
-const freqInput   = document.getElementById('freq');
-const bwInput     = document.getElementById('bandwidth');
-const gainInput   = document.getElementById('gain');
-const devIdxInput = document.getElementById('device_index');
-const sqlInput    = document.getElementById('squelch');
-const devInput    = document.getElementById('audio_device');
-const volInput    = document.getElementById('volume');
-const volLabel    = document.getElementById('volumeVal');
-const statusBox   = document.getElementById('statusBox');
-const logText     = document.getElementById('logText');
-const beepFreqInput   = document.getElementById('beep_freq');
-const openThreshInput = document.getElementById('open_threshold');
-const closeThreshInput= document.getElementById('close_threshold');
+const freqInput        = document.getElementById('freq');
+const bwInput          = document.getElementById('bandwidth');
+const modInput         = document.getElementById('modulation');
+const gainInput        = document.getElementById('gain');
+const devIdxInput      = document.getElementById('device_index');
+const sqlInput         = document.getElementById('squelch');
+const devInput         = document.getElementById('audio_device');
+const volInput         = document.getElementById('volume');
+const volLabel         = document.getElementById('volumeVal');
+const statusBox        = document.getElementById('statusBox');
+const logText          = document.getElementById('logText');
+const beepFreqInput    = document.getElementById('beep_freq');
+const openThreshInput  = document.getElementById('open_threshold');
+const closeThreshInput = document.getElementById('close_threshold');
+
+const scanStartInput   = document.getElementById('scan_start');
+const scanEndInput     = document.getElementById('scan_end');
+const scanStepInput    = document.getElementById('scan_step');
+const scanEnabledInput = document.getElementById('scan_enabled');
 
 async function refresh(){
   try {
     const s = await j('/api/status');
     statusBox.innerHTML =
       `<b>Running:</b> ${s.running}<br>
-       <b>Freq:</b> ${(s.freq/1e6).toFixed(3)} MHz<br>
+       <b>Freq (display):</b> ${(s.freq/1e6).toFixed(3)} MHz<br>
        <b>Bandwidth:</b> ${(s.bandwidth/1e3)} kHz<br>
+       <b>Modulation (-M):</b> ${s.modulation}<br>
        <b>Gain:</b> ${s.gain}<br>
        <b>Squelch (-l):</b> ${s.squelch}<br>
        <b>SDR index (-d):</b> ${s.device_index}<br>
@@ -157,14 +205,22 @@ async function refresh(){
        <b>Beep freq:</b> ${s.beep_freq} Hz<br>
        <b>Open threshold:</b> ${s.open_threshold}<br>
        <b>Close threshold:</b> ${s.close_threshold}<br>
+       <b>Scan enabled:</b> ${s.scan_enabled}<br>
+       <b>Scan start:</b> ${(s.scan_start/1e6).toFixed(3)} MHz<br>
+       <b>Scan end:</b> ${(s.scan_end/1e6).toFixed(3)} MHz<br>
+       <b>Scan step:</b> ${(s.scan_step/1e3).toFixed(1)} kHz<br>
        <b>PID rtl_fm:</b> ${s.pid_rtl || '-'}<br>
        <b>PID aplay:</b> ${s.pid_aplay || '-'}<br>
+       <b>Last rtl_fm cmd:</b> ${s.last_rtl_cmd ? s.last_rtl_cmd.join(' ') : '-'}<br>
+       <b>Last aplay cmd:</b> ${s.last_aplay_cmd ? s.last_aplay_cmd.join(' ') : '-'}<br>
        <b>Last start:</b> ${s.last_start ? new Date(s.last_start*1000).toLocaleString() : '-'}`;
 
     if (document.activeElement !== freqInput)
       freqInput.value = (s.freq/1e6).toFixed(3);
     if (document.activeElement !== bwInput)
       bwInput.value = (s.bandwidth/1e3);
+    if (document.activeElement !== modInput)
+      modInput.value = s.modulation || 'fm';
     if (document.activeElement !== gainInput)
       gainInput.value = s.gain;
     if (document.activeElement !== devIdxInput)
@@ -183,6 +239,14 @@ async function refresh(){
       openThreshInput.value = s.open_threshold;
     if (document.activeElement !== closeThreshInput)
       closeThreshInput.value = s.close_threshold;
+
+    if (document.activeElement !== scanStartInput)
+      scanStartInput.value = (s.scan_start/1e6).toFixed(3);
+    if (document.activeElement !== scanEndInput)
+      scanEndInput.value = (s.scan_end/1e6).toFixed(3);
+    if (document.activeElement !== scanStepInput)
+      scanStepInput.value = (s.scan_step/1e3).toFixed(1);
+    scanEnabledInput.checked = s.scan_enabled;
   } catch (e) {
     statusBox.innerHTML = "Error fetching status: " + e;
   }
@@ -192,6 +256,7 @@ document.getElementById('start').onclick = async () => {
   const payload = {
     freq: parseFloat(freqInput.value) * 1e6,
     bandwidth: parseFloat(bwInput.value) * 1e3,
+    modulation: modInput.value,
     gain: parseInt(gainInput.value),
     device_index: parseInt(devIdxInput.value),
     squelch: parseInt(sqlInput.value),
@@ -199,6 +264,11 @@ document.getElementById('start').onclick = async () => {
     beep_freq: parseInt(beepFreqInput.value),
     open_threshold: parseInt(openThreshInput.value),
     close_threshold: parseInt(closeThreshInput.value),
+
+    scan_enabled: scanEnabledInput.checked,
+    scan_start: parseFloat(scanStartInput.value) * 1e6,
+    scan_end: parseFloat(scanEndInput.value) * 1e6,
+    scan_step: parseFloat(scanStepInput.value) * 1e3,
   };
   try {
     const r = await j('/api/start', 'POST', payload);
@@ -240,11 +310,16 @@ volInput.oninput = async () => {
   }
 };
 
+scanEnabledInput.onchange = () => {
+  // purely UI; real enable/disable happens on Start/Retune
+};
+
 refresh();
 </script>
 </body>
 </html>
 """
+
 
 @app.route("/")
 def index():
@@ -253,15 +328,22 @@ def index():
 
 @app.route("/api/status")
 def api_status():
+    global _rtl_proc, _aplay_proc
     with _proc_lock:
-        running = (
-            _rtl_proc is not None and _rtl_proc.poll() is None and
-            _aplay_proc is not None and _aplay_proc.poll() is None
-        )
+        rtl = _rtl_proc
+        aplay = _aplay_proc
+
+    # Determine actual running state from processes
+    rtl_ok = rtl is not None and rtl.poll() is None
+    aplay_ok = aplay is not None and aplay.poll() is None
+    running = rtl_ok and aplay_ok
+
+    # Keep state["running"] in sync
+    state["running"] = running
+
     s = dict(state)
-    s["running"] = running
-    s["pid_rtl"] = _rtl_proc.pid if _rtl_proc is not None else None
-    s["pid_aplay"] = _aplay_proc.pid if _aplay_proc is not None else None
+    s["pid_rtl"] = rtl.pid if rtl is not None else None
+    s["pid_aplay"] = aplay.pid if aplay is not None else None
     s["last_start"] = _last_start
     return jsonify(s)
 
@@ -285,7 +367,15 @@ def set_volume(percent: int):
 
 
 def build_rtl_cmd():
-    """Build rtl_fm command as a list for subprocess (no shell)."""
+    """
+    Build rtl_fm command as a list for subprocess (no shell).
+
+    If scan_enabled:
+      use built-in scan syntax: -f start_freq:end_freq:step_size
+      (only if start < end and step > 0, else fall back to single freq)
+    else:
+      use single frequency: -f freq_hz
+    """
     freq_hz = int(state["freq"])
     bw_hz = int(state["bandwidth"]) if state["bandwidth"] else 50000
     gain = int(state["gain"])
@@ -293,20 +383,45 @@ def build_rtl_cmd():
 
     rtl_s = max(24000, min(192000, bw_hz))
 
+    # Sanitise modulation
+    mod = (state.get("modulation") or "fm").lower()
+    allowed = {"fm", "wbfm", "raw", "am", "usb", "lsb"}
+    if mod not in allowed:
+        mod = "fm"
+
     cmd = [
         "rtl_fm",
         "-d", str(int(state["device_index"])),
-        "-f", str(freq_hz),
-        "-M", "fm",
+        "-M", mod,
         "-s", str(rtl_s),
         "-E", "deemp",
     ]
+
+    # Frequency / scan
+    if state.get("scan_enabled", False):
+        start = int(state.get("scan_start", freq_hz))
+        end = int(state.get("scan_end", freq_hz))
+        step = int(state.get("scan_step", 25_000))
+        if end > start and step > 0:
+            freq_arg = f"{start}:{end}:{step}"
+        else:
+            # invalid scan params; fall back to single freq
+            freq_arg = str(freq_hz)
+    else:
+        freq_arg = str(freq_hz)
+
+    cmd += ["-f", freq_arg]
+
+    # Gain
     if gain:
         cmd += ["-g", str(gain)]
     else:
         cmd += ["-g", "0"]
+
+    # Squelch
     if squelch > 0:
         cmd += ["-l", str(squelch)]
+
     return cmd
 
 
@@ -384,8 +499,8 @@ def _pipe_audio_loop():
 
     # Snapshot config once for this run
     with _proc_lock:
-        open_th = int(state.get("open_threshold", 3000))
-        close_th = int(state.get("close_threshold", 1500))
+        open_th = int(state.get("open_threshold", 2000))
+        close_th = int(state.get("close_threshold", 250))
         beep_freq = int(state.get("beep_freq", 1000))
         beep_freq = max(200, min(beep_freq, 4000))
         beep_chunk = make_beep(sr=int(state["samplerate"]), freq=beep_freq)
@@ -460,8 +575,6 @@ def _pipe_audio_loop():
         _pipe_thread = None
 
 
-
-
 @app.route("/api/start", methods=["POST"])
 def api_start():
     global _rtl_proc, _aplay_proc, _pipe_thread, _last_start
@@ -470,17 +583,24 @@ def api_start():
 
     # Update state from payload
     for key in (
-        "freq", "bandwidth", "gain", "samplerate",
+        "freq", "bandwidth", "modulation", "gain", "samplerate",
         "audio_device", "device_index", "squelch",
         "open_threshold", "close_threshold", "beep_freq",
+        "scan_start", "scan_end", "scan_step",
     ):
         if key in data:
+            if key == "modulation":
+                state["modulation"] = str(data[key]).lower()
+                continue
             if isinstance(state[key], float):
                 state[key] = float(data[key])
             elif isinstance(state[key], int):
                 state[key] = int(data[key])
             else:
                 state[key] = data[key]
+
+    if "scan_enabled" in data:
+        state["scan_enabled"] = bool(data["scan_enabled"])
 
     with _proc_lock:
         # Stop any existing chain (for retune)
@@ -491,6 +611,10 @@ def api_start():
 
         rtl_cmd = build_rtl_cmd()
         aplay_cmd = build_aplay_cmd()
+
+        # Save last commands for debug / status
+        state["last_rtl_cmd"] = rtl_cmd
+        state["last_aplay_cmd"] = aplay_cmd
 
         # Start rtl_fm first
         try:
