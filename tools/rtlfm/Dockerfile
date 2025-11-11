@@ -1,20 +1,21 @@
 FROM debian:bookworm-slim
 
-# Install rtl_fm (rtl-sdr), aplay (alsa-utils), Python, and Flask from Debian packages
+# Install rtl_fm (rtl-sdr), aplay (alsa-utils), Python, Flask, pip, and libatomic
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     rtl-sdr \
     alsa-utils \
     python3 \
     python3-flask \
+    python3-pip \
     ca-certificates \
+    libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 
-# App lives here
-WORKDIR /opt/app
+# Install Vosk for STT
+RUN pip3 install --no-cache-dir --break-system-packages vosk
 
-# Copy our Flask app with inline HTML UI
+WORKDIR /opt/app
 COPY app.py /opt/app/app.py
 
 EXPOSE 8080
-
 CMD ["python3", "app.py"]

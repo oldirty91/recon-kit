@@ -55,9 +55,10 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     network_mode: "host"
-    privileged: true                 # needed to reset USB ports
+    privileged: true
     devices:
       - "/dev/bus/usb:/dev/bus/usb"
       - "/dev/snd:/dev/snd"
     volumes:
       - "/sys/bus/usb:/sys/bus/usb"
+      - "/home/pi/stt_models:/opt/models:ro"

@@ -5,10 +5,21 @@ import threading
 import time
 import math
 import struct
+import json
+import os
 
 from flask import Flask, jsonify, request, render_template_string
 
 app = Flask(__name__)
+
+# Try to import Vosk for STT (optional)
+try:
+    from vosk import Model, KaldiRecognizer
+    _vosk_available = True
+except Exception:
+    Model = None
+    KaldiRecognizer = None
+    _vosk_available = False
 
 # Global processes + lock
 _rtl_proc = None
@@ -16,6 +27,11 @@ _aplay_proc = None
 _pipe_thread = None
 _proc_lock = threading.Lock()
 _last_start = None
+
+# STT state
+_stt_model = None
+_stt_recognizer = None
+_transcripts = []  # list of {time, offset, freq_hz, text, final?}
 
 # Current settings / state
 state = {
@@ -39,6 +55,9 @@ state = {
     "scan_start": 453.0e6,   # Hz
     "scan_end": 454.0e6,     # Hz
     "scan_step": 25e3,       # Hz
+    # STT (Vosk)
+    "stt_enabled": False,
+    "stt_model_path": "/opt/models/vosk-model-small-en-us-0.15",
     # Debug: last commands
     "last_rtl_cmd": [],
     "last_aplay_cmd": [],
@@ -63,7 +82,7 @@ HTML = """<!doctype html>
 <meta charset="utf-8" />
 <title>RTL-FM Controller</title>
 <style>
-body { font-family: system-ui, sans-serif; padding: 20px; max-width: 1000px; }
+body { font-family: system-ui, sans-serif; padding: 20px; max-width: 1200px; }
 label { display:block; margin-top:8px; }
 input[type="number"], input[type="text"], select { width: 220px; padding:5px; }
 button { margin-top:10px; padding:6px 10px; }
@@ -73,10 +92,11 @@ pre { background:#111; color:#eee; padding:8px; max-height:200px; overflow:auto;
 .inline { display:flex; gap:16px; flex-wrap:wrap; }
 .inline > div { min-width: 260px; }
 small { color:#555; }
+h3 { margin-bottom:4px; }
 </style>
 </head>
 <body>
-<h2>RTL-FM Controller</h2>
+<h2>RTL-FM Controller + Optional STT</h2>
 
 <div class="inline">
   <div>
@@ -148,6 +168,22 @@ small { color:#555; }
     </label>
     <small>Changes take effect when you click Start / Retune.</small>
   </div>
+
+  <div>
+    <h3>STT (Vosk)</h3>
+    <label>
+      <input id="stt_enabled" type="checkbox">
+      Enable STT
+    </label>
+    <label>Model path
+      <input id="stt_model_path" type="text" value="/opt/models/vosk-model-small-en-us-0.15">
+    </label>
+    <small id="sttStatusNote"></small>
+    <div style="margin-top:8px;">
+      <button id="refresh_transcripts">Refresh transcripts</button>
+      <button id="clear_transcripts">Clear transcripts</button>
+    </div>
+  </div>
 </div>
 
 <div>
@@ -157,6 +193,10 @@ small { color:#555; }
 </div>
 
 <div class="status" id="statusBox">Loading...</div>
+
+<h3>Transcripts</h3>
+<pre id="transcriptsBox"></pre>
+
 <button id="logs">Logs</button>
 <pre id="logText"></pre>
 
@@ -189,6 +229,11 @@ const scanEndInput     = document.getElementById('scan_end');
 const scanStepInput    = document.getElementById('scan_step');
 const scanEnabledInput = document.getElementById('scan_enabled');
 
+const sttEnabledInput  = document.getElementById('stt_enabled');
+const sttModelInput    = document.getElementById('stt_model_path');
+const sttStatusNote    = document.getElementById('sttStatusNote');
+const transcriptsBox   = document.getElementById('transcriptsBox');
+
 async function refresh(){
   try {
     const s = await j('/api/status');
@@ -209,6 +254,9 @@ async function refresh(){
        <b>Scan start:</b> ${(s.scan_start/1e6).toFixed(3)} MHz<br>
        <b>Scan end:</b> ${(s.scan_end/1e6).toFixed(3)} MHz<br>
        <b>Scan step:</b> ${(s.scan_step/1e3).toFixed(1)} kHz<br>
+       <b>STT enabled:</b> ${s.stt_enabled}<br>
+       <b>Vosk available:</b> ${s.vosk_available}<br>
+       <b>Transcripts stored:</b> ${s.transcript_count}<br>
        <b>PID rtl_fm:</b> ${s.pid_rtl || '-'}<br>
        <b>PID aplay:</b> ${s.pid_aplay || '-'}<br>
        <b>Last rtl_fm cmd:</b> ${s.last_rtl_cmd ? s.last_rtl_cmd.join(' ') : '-'}<br>
@@ -247,6 +295,17 @@ async function refresh(){
     if (document.activeElement !== scanStepInput)
       scanStepInput.value = (s.scan_step/1e3).toFixed(1);
     scanEnabledInput.checked = s.scan_enabled;
+
+    sttEnabledInput.checked = s.stt_enabled;
+    if (document.activeElement !== sttModelInput)
+      sttModelInput.value = s.stt_model_path || "";
+    if (!s.vosk_available) {
+      sttStatusNote.textContent = "Vosk not installed in this container.";
+    } else {
+      sttStatusNote.textContent = s.stt_enabled
+        ? "STT enabled (model path must be valid)."
+        : "STT available but disabled.";
+    }
   } catch (e) {
     statusBox.innerHTML = "Error fetching status: " + e;
   }
@@ -254,21 +313,24 @@ async function refresh(){
 
 document.getElementById('start').onclick = async () => {
   const payload = {
-    freq: parseFloat(freqInput.value) * 1e6,
-    bandwidth: parseFloat(bwInput.value) * 1e3,
-    modulation: modInput.value,
-    gain: parseInt(gainInput.value),
-    device_index: parseInt(devIdxInput.value),
-    squelch: parseInt(sqlInput.value),
-    audio_device: devInput.value,
-    beep_freq: parseInt(beepFreqInput.value),
+    freq:        parseFloat(freqInput.value) * 1e6,
+    bandwidth:   parseFloat(bwInput.value) * 1e3,
+    modulation:  modInput.value,
+    gain:        parseInt(gainInput.value),
+    device_index:parseInt(devIdxInput.value),
+    squelch:     parseInt(sqlInput.value),
+    audio_device:devInput.value,
+    beep_freq:   parseInt(beepFreqInput.value),
     open_threshold: parseInt(openThreshInput.value),
-    close_threshold: parseInt(closeThreshInput.value),
+    close_threshold:parseInt(closeThreshInput.value),
 
     scan_enabled: scanEnabledInput.checked,
-    scan_start: parseFloat(scanStartInput.value) * 1e6,
-    scan_end: parseFloat(scanEndInput.value) * 1e6,
-    scan_step: parseFloat(scanStepInput.value) * 1e3,
+    scan_start:   parseFloat(scanStartInput.value) * 1e6,
+    scan_end:     parseFloat(scanEndInput.value) * 1e6,
+    scan_step:    parseFloat(scanStepInput.value) * 1e3,
+
+    stt_enabled:    sttEnabledInput.checked,
+    stt_model_path: sttModelInput.value,
   };
   try {
     const r = await j('/api/start', 'POST', payload);
@@ -310,6 +372,35 @@ volInput.oninput = async () => {
   }
 };
 
+document.getElementById('refresh_transcripts').onclick = async () => {
+  try {
+    const r = await j('/api/transcripts');
+    if (!r.ok) {
+      transcriptsBox.textContent = "Error: " + (r.reason || "unknown");
+      return;
+    }
+    let lines = [];
+    for (const t of r.transcripts) {
+      const ts = new Date(t.time * 1000).toLocaleTimeString();
+      const mhz = (t.freq_hz / 1e6).toFixed(3);
+      const off = t.offset.toFixed(1);
+      lines.push(`[${ts} +${off}s @ ${mhz} MHz] ${t.text}`);
+    }
+    transcriptsBox.textContent = lines.join("\\n") || "(no transcripts yet)";
+  } catch (e) {
+    transcriptsBox.textContent = "Error fetching transcripts: " + e;
+  }
+};
+
+document.getElementById('clear_transcripts').onclick = async () => {
+  try {
+    await j('/api/transcripts/clear', 'POST');
+    transcriptsBox.textContent = "";
+  } catch (e) {
+    transcriptsBox.textContent = "Error clearing transcripts: " + e;
+  }
+};
+
 scanEnabledInput.onchange = () => {
   // purely UI; real enable/disable happens on Start/Retune
 };
@@ -338,13 +429,14 @@ def api_status():
     aplay_ok = aplay is not None and aplay.poll() is None
     running = rtl_ok and aplay_ok
 
-    # Keep state["running"] in sync
     state["running"] = running
 
     s = dict(state)
     s["pid_rtl"] = rtl.pid if rtl is not None else None
-    s["pid_aplay"] = aplay.pid if aplay is not None else None
+    s["pid_aplay"] = aplay.pid if _aplay_proc is not None else None
     s["last_start"] = _last_start
+    s["vosk_available"] = _vosk_available
+    s["transcript_count"] = len(_transcripts)
     return jsonify(s)
 
 
@@ -477,25 +569,42 @@ def _stop_current_locked():
     state["running"] = False
 
 
+def _init_stt_if_needed(samplerate: int) -> bool:
+    """
+    Lazily load Vosk model / recognizer if STT is enabled and Vosk is available.
+    Returns True if STT will be active, False otherwise.
+    """
+    global _stt_model, _stt_recognizer
+
+    if not state.get("stt_enabled", False):
+        return False
+    if not _vosk_available:
+        return False
+
+    model_path = state.get("stt_model_path") or ""
+    if not os.path.isdir(model_path):
+        return False
+
+    try:
+        if _stt_model is None or not isinstance(_stt_model, Model):
+            _stt_model = Model(model_path)
+        _stt_recognizer = KaldiRecognizer(_stt_model, samplerate)
+        return True
+    except Exception:
+        _stt_model = None
+        _stt_recognizer = None
+        return False
+
+
 def _pipe_audio_loop():
     """
     Forward PCM from rtl_fm -> aplay and inject a single beep
     when squelch "opens" (carrier/audio present).
 
-    Logic:
-      - Use open_threshold / close_threshold (hysteresis).
-      - squelch_open latches once audio is strong.
-      - We beep only when transitioning from closed -> open,
-        AND at least MIN_BEEP_INTERVAL seconds since last beep.
-      - squelch_open is cleared only after level has been low
-        for HANG_SEC seconds.
-
-    This yields:
-      - One beep at the start of a talk-spurt.
-      - No beeps on closing.
-      - No rapid multi-beeps from tiny dips in level.
+    Also, if STT is enabled, feed the same PCM chunks into Vosk
+    and append completed phrases into _transcripts.
     """
-    global _pipe_thread
+    global _pipe_thread, _transcripts, _stt_recognizer
 
     # Snapshot config once for this run
     with _proc_lock:
@@ -503,7 +612,12 @@ def _pipe_audio_loop():
         close_th = int(state.get("close_threshold", 250))
         beep_freq = int(state.get("beep_freq", 1000))
         beep_freq = max(200, min(beep_freq, 4000))
-        beep_chunk = make_beep(sr=int(state["samplerate"]), freq=beep_freq)
+        samplerate = int(state["samplerate"])
+        beep_chunk = make_beep(sr=samplerate, freq=beep_freq)
+        freq_hz = float(state.get("freq", 0.0))
+
+    # STT init
+    stt_on = _init_stt_if_needed(samplerate)
 
     # Tunables
     HANG_SEC = 0.7           # keep squelch_open this long after last strong audio
@@ -513,10 +627,14 @@ def _pipe_audio_loop():
     last_strong_time = 0.0   # last time level >= open_th
     last_beep_time = 0.0
 
+    bytes_per_sample = 2
+    total_samples = 0  # for STT offset
+
     while True:
         with _proc_lock:
             rtl = _rtl_proc
             aplay = _aplay_proc
+            local_stt_on = stt_on and (_stt_recognizer is not None)
 
         if rtl is None or aplay is None:
             break
@@ -528,6 +646,8 @@ def _pipe_audio_loop():
 
         if not chunk:
             break
+
+        total_samples += len(chunk) // bytes_per_sample
 
         # Compute a crude max-abs level over this chunk
         level = 0
@@ -564,12 +684,57 @@ def _pipe_audio_loop():
                 squelch_open = False
 
         # --- forward the actual audio to aplay ---
-
         try:
             aplay.stdin.write(chunk)
             aplay.stdin.flush()
         except Exception:
             break
+
+        # --- optional STT ---
+        if local_stt_on:
+            try:
+                if _stt_recognizer.AcceptWaveform(chunk):
+                    result = _stt_recognizer.Result()
+                    data = json.loads(result) if result else {}
+                    text = (data.get("text") or "").strip()
+                    if text:
+                        offset_sec = total_samples / float(samplerate)
+                        entry = {
+                            "time": time.time(),
+                            "offset": offset_sec,
+                            "freq_hz": freq_hz,
+                            "text": text,
+                        }
+                        _transcripts.append(entry)
+                        if len(_transcripts) > 200:
+                            _transcripts = _transcripts[-200:]
+            except Exception:
+                # disable STT if it explodes, but keep audio running
+                with _proc_lock:
+                    state["stt_enabled"] = False
+                _stt_recognizer = None
+                stt_on = False
+
+    # At end, flush final STT result
+    if stt_on and _stt_recognizer is not None:
+        try:
+            final = _stt_recognizer.FinalResult()
+            data = json.loads(final) if final else {}
+            text = (data.get("text") or "").strip()
+            if text:
+                offset_sec = total_samples / float(samplerate)
+                entry = {
+                    "time": time.time(),
+                    "offset": offset_sec,
+                    "freq_hz": freq_hz,
+                    "text": text,
+                    "final": True,
+                }
+                _transcripts.append(entry)
+                if len(_transcripts) > 200:
+                    _transcripts = _transcripts[-200:]
+        except Exception:
+            pass
 
     with _proc_lock:
         _pipe_thread = None
@@ -587,6 +752,7 @@ def api_start():
         "audio_device", "device_index", "squelch",
         "open_threshold", "close_threshold", "beep_freq",
         "scan_start", "scan_end", "scan_step",
+        "stt_model_path",
     ):
         if key in data:
             if key == "modulation":
@@ -601,6 +767,8 @@ def api_start():
 
     if "scan_enabled" in data:
         state["scan_enabled"] = bool(data["scan_enabled"])
+    if "stt_enabled" in data:
+        state["stt_enabled"] = bool(data["stt_enabled"])
 
     with _proc_lock:
         # Stop any existing chain (for retune)
@@ -705,6 +873,23 @@ def api_volume():
     vol = max(0, min(100, vol))
     set_volume(vol)
     return jsonify({"ok": True, "volume": vol})
+
+
+@app.route("/api/transcripts")
+def api_transcripts():
+    return jsonify({
+        "ok": True,
+        "transcripts": _transcripts,
+        "stt_enabled": state.get("stt_enabled", False),
+        "vosk_available": _vosk_available,
+    })
+
+
+@app.route("/api/transcripts/clear", methods=["POST"])
+def api_transcripts_clear():
+    global _transcripts
+    _transcripts = []
+    return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
