@@ -16,7 +16,8 @@ app = Flask(__name__)
 try:
     from vosk import Model, KaldiRecognizer
     _vosk_available = True
-except Exception:
+except Exception as e:
+    print("STT: Vosk import failed:", e, flush=True)
     Model = None
     KaldiRecognizer = None
     _vosk_available = False
@@ -28,10 +29,9 @@ _pipe_thread = None
 _proc_lock = threading.Lock()
 _last_start = None
 
-# STT state
-_stt_model = None
-_stt_recognizer = None
-_transcripts = []  # list of {time, offset, freq_hz, text, final?}
+# STT model + transcripts
+_stt_model = None            # cached Vosk model
+_transcripts = []            # list of {time, offset, freq_hz, text, final?}
 
 # Current settings / state
 state = {
@@ -44,20 +44,27 @@ state = {
     "volume": 80,            # percent (amixer)
     "device_index": 0,       # which RTL-SDR: 0, 1, ...
     "squelch": 20,           # rtl_fm -l value (0=off)
+
     # Modulation (-M)
     "modulation": "fm",      # fm, wbfm, raw, am, usb, lsb
-    # Beep / detection config
-    "open_threshold": 2000,  # audio level needed to consider "open"
-    "close_threshold": 250,  # level below which we consider "closed" again
+
+    # Beep / detection config (offsets above noise floor)
+    # These are offsets added to a learned "quiet" level.
+    "open_threshold": 2000,  # offset: noise_floor + this = open level
+    "close_threshold": 250,  # offset: noise_floor + this = close level
+
     "beep_freq": 1000,       # Hz, tone for this SDR
+
     # rtl_fm built-in scan config
     "scan_enabled": False,
     "scan_start": 453.0e6,   # Hz
     "scan_end": 454.0e6,     # Hz
     "scan_step": 25e3,       # Hz
+
     # STT (Vosk)
     "stt_enabled": False,
     "stt_model_path": "/opt/models/vosk-model-small-en-us-0.15",
+
     # Debug: last commands
     "last_rtl_cmd": [],
     "last_aplay_cmd": [],
@@ -142,13 +149,13 @@ h3 { margin-bottom:4px; }
       <input id="beep_freq" type="number" step="50" value="1000">
     </label>
     <small>Use different beep frequencies on each SDR (e.g. 800 Hz vs 1500 Hz)</small>
-    <label>Open threshold (audio level)
+    <label>Open threshold offset
       <input id="open_threshold" type="number" step="100" value="2000">
     </label>
-    <label>Close threshold (audio level)
+    <label>Close threshold offset
       <input id="close_threshold" type="number" step="50" value="250">
     </label>
-    <small>Set close threshold &lt; open threshold to avoid chattering.</small>
+    <small>Dynamic thresholds = noise floor + these offsets (only when squelch > 0).</small>
   </div>
 
   <div>
@@ -173,7 +180,7 @@ h3 { margin-bottom:4px; }
     <h3>STT (Vosk)</h3>
     <label>
       <input id="stt_enabled" type="checkbox">
-      Enable STT
+      Enable STT (only used when squelch > 0)
     </label>
     <label>Model path
       <input id="stt_model_path" type="text" value="/opt/models/vosk-model-small-en-us-0.15">
@@ -248,8 +255,8 @@ async function refresh(){
        <b>Audio:</b> ${s.audio_device}<br>
        <b>Volume:</b> ${s.volume}%<br>
        <b>Beep freq:</b> ${s.beep_freq} Hz<br>
-       <b>Open threshold:</b> ${s.open_threshold}<br>
-       <b>Close threshold:</b> ${s.close_threshold}<br>
+       <b>Open threshold offset:</b> ${s.open_threshold}<br>
+       <b>Close threshold offset:</b> ${s.close_threshold}<br>
        <b>Scan enabled:</b> ${s.scan_enabled}<br>
        <b>Scan start:</b> ${(s.scan_start/1e6).toFixed(3)} MHz<br>
        <b>Scan end:</b> ${(s.scan_end/1e6).toFixed(3)} MHz<br>
@@ -300,10 +307,10 @@ async function refresh(){
     if (document.activeElement !== sttModelInput)
       sttModelInput.value = s.stt_model_path || "";
     if (!s.vosk_available) {
-      sttStatusNote.textContent = "Vosk not installed in this container.";
+      sttStatusNote.textContent = "Vosk not installed or failed to load.";
     } else {
       sttStatusNote.textContent = s.stt_enabled
-        ? "STT enabled (model path must be valid)."
+        ? "STT enabled (squelch-gated)."
         : "STT available but disabled.";
     }
   } catch (e) {
@@ -383,7 +390,7 @@ document.getElementById('refresh_transcripts').onclick = async () => {
     for (const t of r.transcripts) {
       const ts = new Date(t.time * 1000).toLocaleTimeString();
       const mhz = (t.freq_hz / 1e6).toFixed(3);
-      const off = t.offset.toFixed(1);
+      const off = (t.offset || 0).toFixed(1);
       lines.push(`[${ts} +${off}s @ ${mhz} MHz] ${t.text}`);
     }
     transcriptsBox.textContent = lines.join("\\n") || "(no transcripts yet)";
@@ -424,7 +431,6 @@ def api_status():
         rtl = _rtl_proc
         aplay = _aplay_proc
 
-    # Determine actual running state from processes
     rtl_ok = rtl is not None and rtl.poll() is None
     aplay_ok = aplay is not None and aplay.poll() is None
     running = rtl_ok and aplay_ok
@@ -433,7 +439,7 @@ def api_status():
 
     s = dict(state)
     s["pid_rtl"] = rtl.pid if rtl is not None else None
-    s["pid_aplay"] = aplay.pid if _aplay_proc is not None else None
+    s["pid_aplay"] = aplay.pid if aplay is not None else None
     s["last_start"] = _last_start
     s["vosk_available"] = _vosk_available
     s["transcript_count"] = len(_transcripts)
@@ -461,12 +467,6 @@ def set_volume(percent: int):
 def build_rtl_cmd():
     """
     Build rtl_fm command as a list for subprocess (no shell).
-
-    If scan_enabled:
-      use built-in scan syntax: -f start_freq:end_freq:step_size
-      (only if start < end and step > 0, else fall back to single freq)
-    else:
-      use single frequency: -f freq_hz
     """
     freq_hz = int(state["freq"])
     bw_hz = int(state["bandwidth"]) if state["bandwidth"] else 50000
@@ -475,7 +475,6 @@ def build_rtl_cmd():
 
     rtl_s = max(24000, min(192000, bw_hz))
 
-    # Sanitise modulation
     mod = (state.get("modulation") or "fm").lower()
     allowed = {"fm", "wbfm", "raw", "am", "usb", "lsb"}
     if mod not in allowed:
@@ -489,7 +488,6 @@ def build_rtl_cmd():
         "-E", "deemp",
     ]
 
-    # Frequency / scan
     if state.get("scan_enabled", False):
         start = int(state.get("scan_start", freq_hz))
         end = int(state.get("scan_end", freq_hz))
@@ -497,20 +495,17 @@ def build_rtl_cmd():
         if end > start and step > 0:
             freq_arg = f"{start}:{end}:{step}"
         else:
-            # invalid scan params; fall back to single freq
             freq_arg = str(freq_hz)
     else:
         freq_arg = str(freq_hz)
 
     cmd += ["-f", freq_arg]
 
-    # Gain
     if gain:
         cmd += ["-g", str(gain)]
     else:
         cmd += ["-g", "0"]
 
-    # Squelch
     if squelch > 0:
         cmd += ["-l", str(squelch)]
 
@@ -518,7 +513,6 @@ def build_rtl_cmd():
 
 
 def build_aplay_cmd():
-    """Build aplay command as a list for subprocess (no shell)."""
     return [
         "aplay",
         "-f", "S16_LE",
@@ -530,7 +524,6 @@ def build_aplay_cmd():
 
 
 def _stop_current_locked():
-    """Stop current rtl_fm + aplay; caller must hold _proc_lock."""
     global _rtl_proc, _aplay_proc, _pipe_thread
 
     if _rtl_proc is not None and _rtl_proc.poll() is None:
@@ -569,175 +562,334 @@ def _stop_current_locked():
     state["running"] = False
 
 
-def _init_stt_if_needed(samplerate: int) -> bool:
+def _ensure_stt_model():
     """
-    Lazily load Vosk model / recognizer if STT is enabled and Vosk is available.
-    Returns True if STT will be active, False otherwise.
+    Lazily load / cache Vosk model if STT is enabled and squelch > 0.
+    Returns the Model or None and prints debug.
     """
-    global _stt_model, _stt_recognizer
+    global _stt_model
 
-    if not state.get("stt_enabled", False):
-        return False
     if not _vosk_available:
-        return False
+        print("STT: Vosk not available in this container.", flush=True)
+        return None
+    if not state.get("stt_enabled", False):
+        print("STT: disabled in state.", flush=True)
+        return None
+    if int(state.get("squelch", 0)) <= 0:
+        print("STT: squelch <= 0, STT will not run.", flush=True)
+        return None
 
     model_path = state.get("stt_model_path") or ""
     if not os.path.isdir(model_path):
-        return False
+        print(f"STT: model path not a directory: {model_path}", flush=True)
+        return None
 
     try:
-        if _stt_model is None or not isinstance(_stt_model, Model):
+        if _stt_model is None or getattr(_stt_model, "_path", None) != model_path:
+            print(f"STT: loading model from {model_path}", flush=True)
             _stt_model = Model(model_path)
-        _stt_recognizer = KaldiRecognizer(_stt_model, samplerate)
-        return True
-    except Exception:
+            _stt_model._path = model_path
+            print("STT: model loaded OK.", flush=True)
+        else:
+            print(f"STT: reusing cached model {model_path}", flush=True)
+        return _stt_model
+    except Exception as e:
+        print("STT: failed to load model:", e, flush=True)
         _stt_model = None
-        _stt_recognizer = None
-        return False
+        return None
 
 
 def _pipe_audio_loop():
     """
-    Forward PCM from rtl_fm -> aplay and inject a single beep
-    when squelch "opens" (carrier/audio present).
-
-    Also, if STT is enabled, feed the same PCM chunks into Vosk
-    and append completed phrases into _transcripts.
+    Core loop:
+      - read PCM from rtl_fm
+      - forward original PCM to aplay (for listening)
+      - detect "transmissions" (TX) with a simple hang-based state machine
+        for beeps only
+      - run STT as a continuous recognizer independent of TX
     """
-    global _pipe_thread, _transcripts, _stt_recognizer
+    global _pipe_thread, _transcripts
 
-    # Snapshot config once for this run
     with _proc_lock:
-        open_th = int(state.get("open_threshold", 2000))
-        close_th = int(state.get("close_threshold", 250))
-        beep_freq = int(state.get("beep_freq", 1000))
-        beep_freq = max(200, min(beep_freq, 4000))
-        samplerate = int(state["samplerate"])
-        beep_chunk = make_beep(sr=samplerate, freq=beep_freq)
-        freq_hz = float(state.get("freq", 0.0))
+        open_off    = int(state.get("open_threshold", 400))   # margin above noise
+        close_off   = int(state.get("close_threshold", 300))
+        beep_freq   = int(state.get("beep_freq", 1000))
+        beep_freq   = max(200, min(beep_freq, 4000))
+        samplerate  = int(state["samplerate"])                # rtl_fm/aplay sample rate
+        squelch_val = int(state.get("squelch", 0))
+        beep_chunk  = make_beep(sr=samplerate, freq=beep_freq)
+        freq_hz     = float(state.get("freq", 0.0))
+        stt_enabled = bool(state.get("stt_enabled", False))
+        stt_model_path = state.get("stt_model_path", "")
 
-    # STT init
-    stt_on = _init_stt_if_needed(samplerate)
+    # ---- STT model & recognizer (continuous) ----
+    stt_model = _ensure_stt_model()
+    stt_allowed = stt_enabled and (stt_model is not None)
 
-    # Tunables
-    HANG_SEC = 0.7           # keep squelch_open this long after last strong audio
-    MIN_BEEP_INTERVAL = 1.2  # minimum time between beeps
+    STT_RATE  = 16000       # Vosk model rate
+    STT_DECIM = 3           # ~48k -> ~16k
+    STT_GAIN  = 6           # extra gain just for Vosk
 
-    squelch_open = False
-    last_strong_time = 0.0   # last time level >= open_th
-    last_beep_time = 0.0
+    recognizer = None
+    if stt_allowed:
+        try:
+            recognizer = KaldiRecognizer(stt_model, STT_RATE)
+            print(
+                f"STT: continuous recognizer started @ {freq_hz/1e6:.3f} MHz "
+                f"model={stt_model_path}, STT_RATE={STT_RATE}",
+                flush=True,
+            )
+        except Exception as e:
+            print("STT: failed to create continuous recognizer:", e, flush=True)
+            recognizer = None
+            with _proc_lock:
+                state["stt_enabled"] = False
+            stt_allowed = False
 
-    bytes_per_sample = 2
-    total_samples = 0  # for STT offset
+    # STT debug accumulators
+    stt_samples = 0
+    stt_sum_sq  = 0.0
+
+    def _make_stt_chunk(raw_chunk: bytes) -> bytes:
+        """
+        Downsample raw S16_LE chunk by factor STT_DECIM and apply STT_GAIN.
+        Returns new S16_LE bytes at ~16 kHz.
+        """
+        out = bytearray()
+        try:
+            for i, (s,) in enumerate(struct.iter_unpack("<h", raw_chunk)):
+                if i % STT_DECIM != 0:
+                    continue
+                v = s * STT_GAIN
+                if v > 32767:
+                    v = 32767
+                elif v < -32768:
+                    v = -32768
+                out += struct.pack("<h", int(v))
+        except Exception as e:
+            print("STT: error in _make_stt_chunk:", e, flush=True)
+            return b""
+        return bytes(out)
+
+    print(
+        f"PIPE: start; squelch={squelch_val}, STT allowed={stt_allowed}, "
+        f"open_off={open_off}, close_off={close_off}",
+        flush=True,
+    )
+
+    # ---- TX detection for beeps (simple hang logic) ----
+    MIN_RMS_NOISE = 20.0       # below this is basically silence
+
+    HANG_SEC        = 0.7      # keep TX open this long after last "loud"
+    MIN_TX_DURATION = 0.7      # minimum duration to consider it a TX
+    MIN_TX_GAP      = 0.7      # gap between TXs
+    MIN_BEEP_INT    = 0.4      # minimum gap between beeps
+
+    tx_active        = False
+    tx_start_time    = 0.0
+    last_tx_end_time = 0.0
+    hang_until       = 0.0
+    last_beep_time   = 0.0
+
+    # adaptive noise floor (only learned when not in TX)
+    noise_floor = 0.0
+    alpha       = 0.98  # smoothing
 
     while True:
         with _proc_lock:
             rtl = _rtl_proc
             aplay = _aplay_proc
-            local_stt_on = stt_on and (_stt_recognizer is not None)
 
         if rtl is None or aplay is None:
             break
 
         try:
             chunk = rtl.stdout.read(4096)
-        except Exception:
+        except Exception as e:
+            print("PIPE: read error:", e, flush=True)
             break
 
         if not chunk:
             break
 
-        total_samples += len(chunk) // bytes_per_sample
+        # ---- RMS for detection / noise floor ----
+        n_samples = len(chunk) // 2
+        if n_samples <= 0:
+            continue
 
-        # Compute a crude max-abs level over this chunk
-        level = 0
+        sum_sq = 0
         try:
             for (s,) in struct.iter_unpack("<h", chunk):
-                if s < 0:
-                    s = -s
-                if s > level:
-                    level = s
+                sum_sq += s * s
         except Exception:
-            level = 0
+            sum_sq = 0
 
+        rms = math.sqrt(sum_sq / n_samples) if n_samples > 0 else 0.0
         now = time.time()
 
-        # --- squelch / beep logic ---
+        # ---- Update noise floor (only when not TX and squelch>0) ----
+        if squelch_val > 0 and not tx_active:
+            if noise_floor == 0.0:
+                noise_floor = rms
+            else:
+                noise_floor = alpha * noise_floor + (1.0 - alpha) * rms
 
-        if level >= open_th:
-            # strong audio present
-            if not squelch_open:
-                # we're crossing from closed -> open
-                if now - last_beep_time >= MIN_BEEP_INTERVAL:
-                    try:
-                        aplay.stdin.write(beep_chunk)
-                        aplay.stdin.flush()
-                    except Exception:
-                        pass
-                    last_beep_time = now
-            squelch_open = True
-            last_strong_time = now
+        if squelch_val > 0:
+            base = max(noise_floor, MIN_RMS_NOISE)
+            open_th  = base + float(open_off)
+            close_th = base + float(close_off)
+        else:
+            # squelch disabled → no TX detection / beeps
+            open_th = close_th = float("inf")
 
-        elif level <= close_th:
-            # weak/quiet: only close squelch if we've been quiet long enough
-            if squelch_open and (now - last_strong_time) >= HANG_SEC:
-                squelch_open = False
+        # ---- TX state machine (for beeps only) ----
+        if squelch_val > 0:
+            if not tx_active:
+                # consider starting TX if we cross open_th and had enough gap
+                if rms > open_th and (now - last_tx_end_time) >= MIN_TX_GAP:
+                    tx_active     = True
+                    tx_start_time = now
+                    hang_until    = now + HANG_SEC
+                    print(
+                        f"TX START: rms={rms:.1f}, noise_floor={noise_floor:.1f}, "
+                        f"open_th={open_th:.1f}, close_th={close_th:.1f}",
+                        flush=True,
+                    )
+            else:
+                # already in TX
+                if rms > close_th:
+                    # refresh hang timer while loud enough
+                    hang_until = now + HANG_SEC
 
-        # --- forward the actual audio to aplay ---
+                tx_duration = now - tx_start_time
+
+                # end TX only after hang time + minimum duration
+                if now > hang_until and tx_duration >= MIN_TX_DURATION:
+                    tx_active        = False
+                    last_tx_end_time = now
+                    print(
+                        f"TX END: dur={tx_duration:.2f}s, rms={rms:.1f}, "
+                        f"noise_floor={noise_floor:.1f}, open_th={open_th:.1f}, "
+                        f"close_th={close_th:.1f}",
+                        flush=True,
+                    )
+
+                    # single beep at end of TX
+                    if now - last_beep_time >= MIN_BEEP_INT:
+                        try:
+                            aplay.stdin.write(beep_chunk)
+                            aplay.stdin.flush()
+                            print("BEEP: end-of-transmission", flush=True)
+                        except Exception as e:
+                            print("BEEP: write error:", e, flush=True)
+                        last_beep_time = now
+
+        # ---- Always forward original audio to aplay ----
         try:
             aplay.stdin.write(chunk)
             aplay.stdin.flush()
-        except Exception:
+        except Exception as e:
+            print("PIPE: aplay write error:", e, flush=True)
             break
 
-        # --- optional STT ---
-        if local_stt_on:
-            try:
-                if _stt_recognizer.AcceptWaveform(chunk):
-                    result = _stt_recognizer.Result()
-                    data = json.loads(result) if result else {}
-                    text = (data.get("text") or "").strip()
-                    if text:
-                        offset_sec = total_samples / float(samplerate)
-                        entry = {
-                            "time": time.time(),
-                            "offset": offset_sec,
-                            "freq_hz": freq_hz,
-                            "text": text,
-                        }
-                        _transcripts.append(entry)
-                        if len(_transcripts) > 200:
-                            _transcripts = _transcripts[-200:]
-            except Exception:
-                # disable STT if it explodes, but keep audio running
-                with _proc_lock:
-                    state["stt_enabled"] = False
-                _stt_recognizer = None
-                stt_on = False
+        # ---- Continuous STT feed (independent of TX) ----
+        if stt_allowed and recognizer is not None:
+            stt_chunk = _make_stt_chunk(chunk)
+            if stt_chunk:
+                ns = len(stt_chunk) // 2
+                stt_samples += ns
+                # debug RMS for STT stream
+                try:
+                    sum_sq_stt = 0
+                    for (s,) in struct.iter_unpack("<h", stt_chunk):
+                        sum_sq_stt += s * s
+                    stt_sum_sq += sum_sq_stt
+                except Exception:
+                    pass
 
-    # At end, flush final STT result
-    if stt_on and _stt_recognizer is not None:
+                try:
+                    if recognizer.AcceptWaveform(stt_chunk):
+                        res = recognizer.Result()
+                        try:
+                            data = json.loads(res) if res else {}
+                        except Exception:
+                            data = {}
+                        txt = (data.get("text") or "").strip()
+                        stt_rms = (
+                            math.sqrt(stt_sum_sq / stt_samples)
+                            if stt_samples > 0 else 0.0
+                        )
+                        print(
+                            f"STT: Result raw={data}, stt_samples={stt_samples}, "
+                            f"stt_rms={stt_rms:.1f}",
+                            flush=True,
+                        )
+                        if txt:
+                            entry = {
+                                "time": time.time(),
+                                "offset": stt_samples / float(STT_RATE)
+                                if STT_RATE > 0 else 0.0,
+                                "freq_hz": freq_hz,
+                                "text": txt,
+                                "final": True,
+                            }
+                            _transcripts.append(entry)
+                            if len(_transcripts) > 200:
+                                _transcripts = _transcripts[-200:]
+                            print("STT: stored transcript:", entry, flush=True)
+                        # reset STT energy stats each utterance
+                        stt_samples = 0
+                        stt_sum_sq  = 0.0
+                    else:
+                        # Optional: see partials for debugging
+                        # p = recognizer.PartialResult()
+                        # print("STT: partial:", p, flush=True)
+                        pass
+                except Exception as e:
+                    print("STT: AcceptWaveform error:", e, flush=True)
+                    with _proc_lock:
+                        state["stt_enabled"] = False
+                    recognizer = None
+                    stt_allowed = False
+
+    # ---- Flush STT on exit ----
+    if stt_allowed and recognizer is not None:
         try:
-            final = _stt_recognizer.FinalResult()
-            data = json.loads(final) if final else {}
-            text = (data.get("text") or "").strip()
-            if text:
-                offset_sec = total_samples / float(samplerate)
+            final = recognizer.FinalResult()
+            try:
+                data = json.loads(final) if final else {}
+            except Exception:
+                data = {}
+            txt = (data.get("text") or "").strip()
+            stt_rms = (
+                math.sqrt(stt_sum_sq / stt_samples)
+                if stt_samples > 0 else 0.0
+            )
+            print(
+                f"STT: FinalResult on loop exit: raw={data}, "
+                f"stt_samples={stt_samples}, stt_rms={stt_rms:.1f}",
+                flush=True,
+            )
+            if txt:
                 entry = {
                     "time": time.time(),
-                    "offset": offset_sec,
+                    "offset": stt_samples / float(STT_RATE)
+                    if STT_RATE > 0 else 0.0,
                     "freq_hz": freq_hz,
-                    "text": text,
+                    "text": txt,
                     "final": True,
                 }
                 _transcripts.append(entry)
                 if len(_transcripts) > 200:
                     _transcripts = _transcripts[-200:]
-        except Exception:
-            pass
+                print("STT: stored transcript on exit:", entry, flush=True)
+        except Exception as e:
+            print("STT: FinalResult error on exit:", e, flush=True)
 
     with _proc_lock:
         _pipe_thread = None
+
+
 
 
 @app.route("/api/start", methods=["POST"])
@@ -746,7 +898,6 @@ def api_start():
 
     data = request.get_json() or {}
 
-    # Update state from payload
     for key in (
         "freq", "bandwidth", "modulation", "gain", "samplerate",
         "audio_device", "device_index", "squelch",
@@ -770,21 +921,18 @@ def api_start():
     if "stt_enabled" in data:
         state["stt_enabled"] = bool(data["stt_enabled"])
 
-    with _proc_lock:
-        # Stop any existing chain (for retune)
-        _stop_current_locked()
+    print("API /start: state =", state, flush=True)
 
-        # Volume
+    with _proc_lock:
+        _stop_current_locked()
         set_volume(state.get("volume", 80))
 
         rtl_cmd = build_rtl_cmd()
         aplay_cmd = build_aplay_cmd()
-
-        # Save last commands for debug / status
         state["last_rtl_cmd"] = rtl_cmd
         state["last_aplay_cmd"] = aplay_cmd
 
-        # Start rtl_fm first
+        print("Starting rtl_fm:", rtl_cmd, flush=True)
         try:
             _rtl_proc = subprocess.Popen(
                 rtl_cmd,
@@ -793,9 +941,10 @@ def api_start():
             )
         except Exception as e:
             _rtl_proc = None
+            print("Failed to start rtl_fm:", e, flush=True)
             return jsonify({"ok": False, "error": f"failed to start rtl_fm: {e}"}), 500
 
-        # Then start aplay, consuming PCM from us (thread)
+        print("Starting aplay:", aplay_cmd, flush=True)
         try:
             _aplay_proc = subprocess.Popen(
                 aplay_cmd,
@@ -804,6 +953,7 @@ def api_start():
                 stderr=subprocess.PIPE,
             )
         except Exception as e:
+            print("Failed to start aplay:", e, flush=True)
             try:
                 _rtl_proc.send_signal(signal.SIGINT)
             except Exception:
@@ -815,7 +965,6 @@ def api_start():
             _aplay_proc = None
             return jsonify({"ok": False, "error": f"failed to start aplay: {e}"}), 500
 
-        # Start audio pipe thread
         _pipe_thread = threading.Thread(target=_pipe_audio_loop, daemon=True)
         _pipe_thread.start()
 
