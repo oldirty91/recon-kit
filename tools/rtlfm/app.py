@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import signal
 import subprocess
 import threading
@@ -6,21 +7,18 @@ import time
 import math
 import struct
 import json
-import os
 
 from flask import Flask, jsonify, request, render_template_string
 
-app = Flask(__name__)
-
-# Try to import Vosk for STT (optional)
+# Try Vosk STT
 try:
-    from vosk import Model, KaldiRecognizer
-    _vosk_available = True
-except Exception as e:
-    print("STT: Vosk import failed:", e, flush=True)
-    Model = None
-    KaldiRecognizer = None
-    _vosk_available = False
+    import vosk  # type: ignore
+    _VOSK_OK = True
+except Exception:
+    vosk = None
+    _VOSK_OK = False
+
+app = Flask(__name__)
 
 # Global processes + lock
 _rtl_proc = None
@@ -29,9 +27,13 @@ _pipe_thread = None
 _proc_lock = threading.Lock()
 _last_start = None
 
-# STT model + transcripts
-_stt_model = None            # cached Vosk model
-_transcripts = []            # list of {time, offset, freq_hz, text, final?}
+# STT globals
+_stt_model = None
+_stt_rec = None
+_stt_model_path_loaded = None
+_stt_lock = threading.Lock()
+_transcripts = []  # list of dicts: {time, offset, freq_hz, text, final}
+_STT_MAX_ITEMS = 200
 
 # Current settings / state
 state = {
@@ -44,27 +46,25 @@ state = {
     "volume": 80,            # percent (amixer)
     "device_index": 0,       # which RTL-SDR: 0, 1, ...
     "squelch": 20,           # rtl_fm -l value (0=off)
-
     # Modulation (-M)
     "modulation": "fm",      # fm, wbfm, raw, am, usb, lsb
-
-    # Beep / detection config (offsets above noise floor)
-    # These are offsets added to a learned "quiet" level.
-    "open_threshold": 2000,  # offset: noise_floor + this = open level
-    "close_threshold": 250,  # offset: noise_floor + this = close level
-
+    # Beep / detection config
+    "open_threshold": 400,   # default offsets, not absolute
+    "close_threshold": 300,
     "beep_freq": 1000,       # Hz, tone for this SDR
-
-    # rtl_fm built-in scan config
+    # rtl_fm built-in scan config (range)
     "scan_enabled": False,
     "scan_start": 453.0e6,   # Hz
     "scan_end": 454.0e6,     # Hz
     "scan_step": 25e3,       # Hz
-
-    # STT (Vosk)
-    "stt_enabled": False,
+    # NEW: explicit comma-separated scan frequency list (MHz)
+    # If set, we pass multiple -f entries and ignore range scanning.
+    "scan_freqlist": "",
+    # STT config
+    "stt_enabled": True,
+    # Default to SMALL model (your request)
     "stt_model_path": "/opt/models/vosk-model-small-en-us-0.15",
-
+    "stt_gain": 6.0,         # linear gain applied to STT audio path
     # Debug: last commands
     "last_rtl_cmd": [],
     "last_aplay_cmd": [],
@@ -72,9 +72,7 @@ state = {
 
 
 def make_beep(sr=48000, freq=1000, duration=0.06, volume=0.4):
-    """
-    Generate a short S16_LE mono beep.
-    """
+    """Generate a short S16_LE mono beep."""
     n_samples = int(sr * duration)
     frames = []
     for n in range(n_samples):
@@ -99,11 +97,13 @@ pre { background:#111; color:#eee; padding:8px; max-height:200px; overflow:auto;
 .inline { display:flex; gap:16px; flex-wrap:wrap; }
 .inline > div { min-width: 260px; }
 small { color:#555; }
-h3 { margin-bottom:4px; }
+table { border-collapse: collapse; width: 100%; font-size: 0.9em; }
+th, td { border: 1px solid #ccc; padding: 4px 6px; text-align: left; }
+th { background: #eee; }
 </style>
 </head>
 <body>
-<h2>RTL-FM Controller + Optional STT</h2>
+<h2>RTL-FM Controller</h2>
 
 <div class="inline">
   <div>
@@ -150,12 +150,12 @@ h3 { margin-bottom:4px; }
     </label>
     <small>Use different beep frequencies on each SDR (e.g. 800 Hz vs 1500 Hz)</small>
     <label>Open threshold offset
-      <input id="open_threshold" type="number" step="100" value="2000">
+      <input id="open_threshold" type="number" step="50" value="400">
     </label>
     <label>Close threshold offset
-      <input id="close_threshold" type="number" step="50" value="250">
+      <input id="close_threshold" type="number" step="50" value="300">
     </label>
-    <small>Dynamic thresholds = noise floor + these offsets (only when squelch > 0).</small>
+    <small>Thresholds are offsets above the tracked noise floor.</small>
   </div>
 
   <div>
@@ -174,22 +174,27 @@ h3 { margin-bottom:4px; }
       Enable scan (rtl_fm -f start:end:step)
     </label>
     <small>Changes take effect when you click Start / Retune.</small>
+
+    <label style="margin-top:12px;">Frequency list (MHz, comma-separated)
+      <input id="scan_freqlist" type="text" placeholder="e.g. 462.5625,462.5875,462.6125">
+    </label>
+    <small>If set, uses multiple <code>-f</code> entries and overrides range/center.</small>
   </div>
 
   <div>
-    <h3>STT (Vosk)</h3>
+    <h3>Speech-to-Text (Vosk)</h3>
     <label>
-      <input id="stt_enabled" type="checkbox">
-      Enable STT (only used when squelch > 0)
+      <input id="stt_enabled" type="checkbox" checked>
+      Enable STT
     </label>
-    <label>Model path
+    <small id="stt_avail_note"></small>
+    <label>Model path in container
       <input id="stt_model_path" type="text" value="/opt/models/vosk-model-small-en-us-0.15">
     </label>
-    <small id="sttStatusNote"></small>
-    <div style="margin-top:8px;">
-      <button id="refresh_transcripts">Refresh transcripts</button>
-      <button id="clear_transcripts">Clear transcripts</button>
-    </div>
+    <label>STT gain (x)
+      <input id="stt_gain" type="number" step="0.5" value="6.0">
+    </label>
+    <small>Gain applied only on STT path (not the audio you hear).</small>
   </div>
 </div>
 
@@ -200,12 +205,21 @@ h3 { margin-bottom:4px; }
 </div>
 
 <div class="status" id="statusBox">Loading...</div>
-
-<h3>Transcripts</h3>
-<pre id="transcriptsBox"></pre>
-
 <button id="logs">Logs</button>
 <pre id="logText"></pre>
+
+<h3>Transcripts (last 50, newest first)</h3>
+<table>
+  <thead>
+    <tr>
+      <th>Time</th>
+      <th>Freq (MHz)</th>
+      <th>Text</th>
+    </tr>
+  </thead>
+  <tbody id="transBody">
+  </tbody>
+</table>
 
 <script>
 function j(url, m='GET', b=null){
@@ -235,11 +249,13 @@ const scanStartInput   = document.getElementById('scan_start');
 const scanEndInput     = document.getElementById('scan_end');
 const scanStepInput    = document.getElementById('scan_step');
 const scanEnabledInput = document.getElementById('scan_enabled');
+const scanListInput    = document.getElementById('scan_freqlist');
 
 const sttEnabledInput  = document.getElementById('stt_enabled');
 const sttModelInput    = document.getElementById('stt_model_path');
-const sttStatusNote    = document.getElementById('sttStatusNote');
-const transcriptsBox   = document.getElementById('transcriptsBox');
+const sttGainInput     = document.getElementById('stt_gain');
+const sttAvailNote     = document.getElementById('stt_avail_note');
+const transBody        = document.getElementById('transBody');
 
 async function refresh(){
   try {
@@ -255,15 +271,17 @@ async function refresh(){
        <b>Audio:</b> ${s.audio_device}<br>
        <b>Volume:</b> ${s.volume}%<br>
        <b>Beep freq:</b> ${s.beep_freq} Hz<br>
-       <b>Open threshold offset:</b> ${s.open_threshold}<br>
-       <b>Close threshold offset:</b> ${s.close_threshold}<br>
+       <b>Open offset:</b> ${s.open_threshold}<br>
+       <b>Close offset:</b> ${s.close_threshold}<br>
        <b>Scan enabled:</b> ${s.scan_enabled}<br>
        <b>Scan start:</b> ${(s.scan_start/1e6).toFixed(3)} MHz<br>
        <b>Scan end:</b> ${(s.scan_end/1e6).toFixed(3)} MHz<br>
        <b>Scan step:</b> ${(s.scan_step/1e3).toFixed(1)} kHz<br>
+       <b>Freq list:</b> ${s.scan_freqlist || '(none)'}<br>
        <b>STT enabled:</b> ${s.stt_enabled}<br>
-       <b>Vosk available:</b> ${s.vosk_available}<br>
-       <b>Transcripts stored:</b> ${s.transcript_count}<br>
+       <b>STT available:</b> ${s.stt_available}<br>
+       <b>STT model path:</b> ${s.stt_model_path}<br>
+       <b>STT gain:</b> ${s.stt_gain}<br>
        <b>PID rtl_fm:</b> ${s.pid_rtl || '-'}<br>
        <b>PID aplay:</b> ${s.pid_aplay || '-'}<br>
        <b>Last rtl_fm cmd:</b> ${s.last_rtl_cmd ? s.last_rtl_cmd.join(' ') : '-'}<br>
@@ -301,18 +319,19 @@ async function refresh(){
       scanEndInput.value = (s.scan_end/1e6).toFixed(3);
     if (document.activeElement !== scanStepInput)
       scanStepInput.value = (s.scan_step/1e3).toFixed(1);
+    if (document.activeElement !== scanListInput)
+      scanListInput.value = s.scan_freqlist || "";
     scanEnabledInput.checked = s.scan_enabled;
 
     sttEnabledInput.checked = s.stt_enabled;
     if (document.activeElement !== sttModelInput)
       sttModelInput.value = s.stt_model_path || "";
-    if (!s.vosk_available) {
-      sttStatusNote.textContent = "Vosk not installed or failed to load.";
-    } else {
-      sttStatusNote.textContent = s.stt_enabled
-        ? "STT enabled (squelch-gated)."
-        : "STT available but disabled.";
-    }
+    if (document.activeElement !== sttGainInput)
+      sttGainInput.value = s.stt_gain;
+
+    sttAvailNote.textContent = s.stt_available
+      ? "Vosk available."
+      : "Vosk not available in this container.";
   } catch (e) {
     statusBox.innerHTML = "Error fetching status: " + e;
   }
@@ -320,24 +339,26 @@ async function refresh(){
 
 document.getElementById('start').onclick = async () => {
   const payload = {
-    freq:        parseFloat(freqInput.value) * 1e6,
-    bandwidth:   parseFloat(bwInput.value) * 1e3,
-    modulation:  modInput.value,
-    gain:        parseInt(gainInput.value),
-    device_index:parseInt(devIdxInput.value),
-    squelch:     parseInt(sqlInput.value),
-    audio_device:devInput.value,
-    beep_freq:   parseInt(beepFreqInput.value),
+    freq: parseFloat(freqInput.value) * 1e6,
+    bandwidth: parseFloat(bwInput.value) * 1e3,
+    modulation: modInput.value,
+    gain: parseInt(gainInput.value),
+    device_index: parseInt(devIdxInput.value),
+    squelch: parseInt(sqlInput.value),
+    audio_device: devInput.value,
+    beep_freq: parseInt(beepFreqInput.value),
     open_threshold: parseInt(openThreshInput.value),
-    close_threshold:parseInt(closeThreshInput.value),
+    close_threshold: parseInt(closeThreshInput.value),
 
     scan_enabled: scanEnabledInput.checked,
-    scan_start:   parseFloat(scanStartInput.value) * 1e6,
-    scan_end:     parseFloat(scanEndInput.value) * 1e6,
-    scan_step:    parseFloat(scanStepInput.value) * 1e3,
+    scan_start: parseFloat(scanStartInput.value) * 1e6,
+    scan_end: parseFloat(scanEndInput.value) * 1e6,
+    scan_step: parseFloat(scanStepInput.value) * 1e3,
+    scan_freqlist: scanListInput.value,   // NEW
 
-    stt_enabled:    sttEnabledInput.checked,
+    stt_enabled: sttEnabledInput.checked,
     stt_model_path: sttModelInput.value,
+    stt_gain: parseFloat(sttGainInput.value),
   };
   try {
     const r = await j('/api/start', 'POST', payload);
@@ -379,40 +400,37 @@ volInput.oninput = async () => {
   }
 };
 
-document.getElementById('refresh_transcripts').onclick = async () => {
+async function refreshTranscripts() {
   try {
     const r = await j('/api/transcripts');
-    if (!r.ok) {
-      transcriptsBox.textContent = "Error: " + (r.reason || "unknown");
-      return;
+    transBody.innerHTML = "";
+    if (!r.ok || !r.items) return;
+    // NEWEST FIRST: take last 50, then reverse for newest-first display
+    const items = r.items.slice(-50).reverse();
+    for (const t of items) {
+      const tr = document.createElement('tr');
+      const tdTime = document.createElement('td');
+      const tdFreq = document.createElement('td');
+      const tdText = document.createElement('td');
+
+      const d = new Date(t.time * 1000);
+      tdTime.textContent = d.toLocaleTimeString();
+      tdFreq.textContent = (t.freq_hz/1e6).toFixed(3);
+      tdText.textContent = t.text;
+
+      tr.appendChild(tdTime);
+      tr.appendChild(tdFreq);
+      tr.appendChild(tdText);
+      transBody.appendChild(tr);
     }
-    let lines = [];
-    for (const t of r.transcripts) {
-      const ts = new Date(t.time * 1000).toLocaleTimeString();
-      const mhz = (t.freq_hz / 1e6).toFixed(3);
-      const off = (t.offset || 0).toFixed(1);
-      lines.push(`[${ts} +${off}s @ ${mhz} MHz] ${t.text}`);
-    }
-    transcriptsBox.textContent = lines.join("\\n") || "(no transcripts yet)";
   } catch (e) {
-    transcriptsBox.textContent = "Error fetching transcripts: " + e;
+    // ignore
   }
-};
+}
 
-document.getElementById('clear_transcripts').onclick = async () => {
-  try {
-    await j('/api/transcripts/clear', 'POST');
-    transcriptsBox.textContent = "";
-  } catch (e) {
-    transcriptsBox.textContent = "Error clearing transcripts: " + e;
-  }
-};
-
-scanEnabledInput.onchange = () => {
-  // purely UI; real enable/disable happens on Start/Retune
-};
-
+// Poll status + transcripts
 refresh();
+setInterval(refreshTranscripts, 2000);
 </script>
 </body>
 </html>
@@ -434,15 +452,13 @@ def api_status():
     rtl_ok = rtl is not None and rtl.poll() is None
     aplay_ok = aplay is not None and aplay.poll() is None
     running = rtl_ok and aplay_ok
-
     state["running"] = running
 
     s = dict(state)
     s["pid_rtl"] = rtl.pid if rtl is not None else None
     s["pid_aplay"] = aplay.pid if aplay is not None else None
     s["last_start"] = _last_start
-    s["vosk_available"] = _vosk_available
-    s["transcript_count"] = len(_transcripts)
+    s["stt_available"] = bool(_VOSK_OK)
     return jsonify(s)
 
 
@@ -467,6 +483,11 @@ def set_volume(percent: int):
 def build_rtl_cmd():
     """
     Build rtl_fm command as a list for subprocess (no shell).
+
+    Priority:
+      1) If scan_freqlist is non-empty: add multiple -f <Hz> entries (overrides everything).
+      2) Else if scan_enabled: -f start:end:step
+      3) Else: -f freq_hz (single)
     """
     freq_hz = int(state["freq"])
     bw_hz = int(state["bandwidth"]) if state["bandwidth"] else 50000
@@ -488,18 +509,30 @@ def build_rtl_cmd():
         "-E", "deemp",
     ]
 
-    if state.get("scan_enabled", False):
-        start = int(state.get("scan_start", freq_hz))
-        end = int(state.get("scan_end", freq_hz))
-        step = int(state.get("scan_step", 25_000))
-        if end > start and step > 0:
-            freq_arg = f"{start}:{end}:{step}"
+    # NEW: explicit list of frequencies (MHz, comma-separated)
+    freqlist = (state.get("scan_freqlist") or "").strip()
+    if freqlist:
+        for token in freqlist.split(","):
+            t = token.strip()
+            if not t:
+                continue
+            try:
+                mhz = float(t)
+                cmd += ["-f", str(int(round(mhz * 1e6)))]
+            except Exception:
+                continue
+    else:
+        if state.get("scan_enabled", False):
+            start = int(state.get("scan_start", freq_hz))
+            end = int(state.get("scan_end", freq_hz))
+            step = int(state.get("scan_step", 25_000))
+            if end > start and step > 0:
+                freq_arg = f"{start}:{end}:{step}"
+            else:
+                freq_arg = str(freq_hz)
         else:
             freq_arg = str(freq_hz)
-    else:
-        freq_arg = str(freq_hz)
-
-    cmd += ["-f", freq_arg]
+        cmd += ["-f", freq_arg]
 
     if gain:
         cmd += ["-g", str(gain)]
@@ -513,6 +546,7 @@ def build_rtl_cmd():
 
 
 def build_aplay_cmd():
+    """Build aplay command as a list for subprocess (no shell)."""
     return [
         "aplay",
         "-f", "S16_LE",
@@ -524,6 +558,7 @@ def build_aplay_cmd():
 
 
 def _stop_current_locked():
+    """Stop current rtl_fm + aplay; caller must hold _proc_lock."""
     global _rtl_proc, _aplay_proc, _pipe_thread
 
     if _rtl_proc is not None and _rtl_proc.poll() is None:
@@ -563,137 +598,148 @@ def _stop_current_locked():
 
 
 def _ensure_stt_model():
-    """
-    Lazily load / cache Vosk model if STT is enabled and squelch > 0.
-    Returns the Model or None and prints debug.
-    """
-    global _stt_model
-
-    if not _vosk_available:
-        print("STT: Vosk not available in this container.", flush=True)
-        return None
-    if not state.get("stt_enabled", False):
-        print("STT: disabled in state.", flush=True)
-        return None
-    if int(state.get("squelch", 0)) <= 0:
-        print("STT: squelch <= 0, STT will not run.", flush=True)
-        return None
+    """Load Vosk model if needed."""
+    global _stt_model, _stt_rec, _stt_model_path_loaded
+    if not _VOSK_OK:
+        return False
 
     model_path = state.get("stt_model_path") or ""
-    if not os.path.isdir(model_path):
-        print(f"STT: model path not a directory: {model_path}", flush=True)
-        return None
+    if not model_path:
+        return False
 
-    try:
-        if _stt_model is None or getattr(_stt_model, "_path", None) != model_path:
-            print(f"STT: loading model from {model_path}", flush=True)
-            _stt_model = Model(model_path)
-            _stt_model._path = model_path
-            print("STT: model loaded OK.", flush=True)
-        else:
-            print(f"STT: reusing cached model {model_path}", flush=True)
-        return _stt_model
-    except Exception as e:
-        print("STT: failed to load model:", e, flush=True)
-        _stt_model = None
+    if _stt_model is not None and _stt_model_path_loaded == model_path:
+        return True
+
+    if not os.path.isdir(model_path):
+        print(f"STT: model path does not exist: {model_path}", flush=True)
+        return False
+
+    print(f"STT: loading model from {model_path}", flush=True)
+    _stt_model = vosk.Model(model_path)
+    _stt_model_path_loaded = model_path
+    print("STT: model loaded OK.", flush=True)
+
+    # recognizer created later in _make_stt_recognizer
+    _stt_rec = None
+    return True
+
+
+def _make_stt_recognizer():
+    global _stt_model, _stt_rec
+    if not _ensure_stt_model():
         return None
+    if _stt_rec is None:
+        stt_rate = 16000
+        _stt_rec = vosk.KaldiRecognizer(_stt_model, stt_rate)
+        print(
+            f"STT: continuous recognizer started @ {state['freq']/1e6:.3f} MHz "
+            f"model={state['stt_model_path']}, STT_RATE={stt_rate}",
+            flush=True
+        )
+    return _stt_rec
+
+
+def _stt_feed(chunk_48k: bytes, stt_gain: float):
+    """Downsample 48k -> 16k and feed into recognizer."""
+    if not state.get("stt_enabled", False):
+        return
+    if not _VOSK_OK:
+        return
+
+    with _stt_lock:
+        rec = _make_stt_recognizer()
+        if rec is None:
+            return
+
+        # Interpret as 16-bit little-endian mono @ 48kHz
+        try:
+            samples = list(struct.iter_unpack("<h", chunk_48k))
+        except Exception:
+            return
+
+        if not samples:
+            return
+
+        # Downsample by 3 (48k -> 16k) and apply gain
+        out = bytearray()
+        for i in range(0, len(samples), 3):
+            s = samples[i][0]
+            s = int(max(-32767, min(32767, s * stt_gain)))
+            out.extend(struct.pack("<h", s))
+
+        if not out:
+            return
+
+        # Feed into vosk
+        if rec.AcceptWaveform(bytes(out)):
+            res = rec.Result()
+            try:
+                obj = json.loads(res)
+            except Exception:
+                obj = {}
+            text = (obj.get("text") or "").strip()
+            if text:
+                # simple RMS-ish for debug
+                vals = [struct.unpack("<h", out[i:i+2])[0] for i in range(0, len(out), 2)]
+                stt_rms = (sum(v*v for v in vals)/len(vals))**0.5 if vals else 0.0
+                print(
+                    f"STT: Result raw={obj}, stt_samples={len(vals)}, stt_rms={stt_rms:.1f}",
+                    flush=True
+                )
+                _store_transcript(text)
+        else:
+            # optional: could inspect PartialResult; ignoring for now
+            pass
+
+
+def _store_transcript(text: str):
+    """Append one transcript entry, keep bounded length."""
+    global _transcripts
+    item = {
+        "time": time.time(),
+        "offset": 0.0,  # placeholder; could track stream offset later
+        "freq_hz": state.get("freq", 0.0),
+        "text": text,
+        "final": True,
+    }
+    _transcripts.append(item)
+    if len(_transcripts) > _STT_MAX_ITEMS:
+        _transcripts = _transcripts[-_STT_MAX_ITEMS:]
+    print(f"STT: stored transcript: {item}", flush=True)
 
 
 def _pipe_audio_loop():
     """
-    Core loop:
-      - read PCM from rtl_fm
-      - forward original PCM to aplay (for listening)
-      - detect "transmissions" (TX) with a simple hang-based state machine
-        for beeps only
-      - run STT as a continuous recognizer independent of TX
+    Forward PCM from rtl_fm -> aplay and:
+      - detect TX start/end based on dynamic thresholds
+      - beep once at end of TX
+      - optionally feed audio to Vosk STT (separate gain path)
     """
-    global _pipe_thread, _transcripts
+    global _pipe_thread
 
     with _proc_lock:
-        open_off    = int(state.get("open_threshold", 400))   # margin above noise
-        close_off   = int(state.get("close_threshold", 300))
-        beep_freq   = int(state.get("beep_freq", 1000))
-        beep_freq   = max(200, min(beep_freq, 4000))
-        samplerate  = int(state["samplerate"])                # rtl_fm/aplay sample rate
-        squelch_val = int(state.get("squelch", 0))
-        beep_chunk  = make_beep(sr=samplerate, freq=beep_freq)
-        freq_hz     = float(state.get("freq", 0.0))
+        squelch = int(state.get("squelch", 0))
+        open_off = int(state.get("open_threshold", 400))
+        close_off = int(state.get("close_threshold", 300))
+        beep_freq = int(state.get("beep_freq", 1000))
+        beep_freq = max(200, min(beep_freq, 4000))
+        beep_chunk = make_beep(sr=int(state["samplerate"]), freq=beep_freq)
         stt_enabled = bool(state.get("stt_enabled", False))
-        stt_model_path = state.get("stt_model_path", "")
+        stt_gain = float(state.get("stt_gain", 6.0))
 
-    # ---- STT model & recognizer (continuous) ----
-    stt_model = _ensure_stt_model()
-    stt_allowed = stt_enabled and (stt_model is not None)
+    HANG_SEC = 0.6
+    noise_floor = 0.0
+    noise_alpha = 0.01
 
-    STT_RATE  = 16000       # Vosk model rate
-    STT_DECIM = 3           # ~48k -> ~16k
-    STT_GAIN  = 6           # extra gain just for Vosk
-
-    recognizer = None
-    if stt_allowed:
-        try:
-            recognizer = KaldiRecognizer(stt_model, STT_RATE)
-            print(
-                f"STT: continuous recognizer started @ {freq_hz/1e6:.3f} MHz "
-                f"model={stt_model_path}, STT_RATE={STT_RATE}",
-                flush=True,
-            )
-        except Exception as e:
-            print("STT: failed to create continuous recognizer:", e, flush=True)
-            recognizer = None
-            with _proc_lock:
-                state["stt_enabled"] = False
-            stt_allowed = False
-
-    # STT debug accumulators
-    stt_samples = 0
-    stt_sum_sq  = 0.0
-
-    def _make_stt_chunk(raw_chunk: bytes) -> bytes:
-        """
-        Downsample raw S16_LE chunk by factor STT_DECIM and apply STT_GAIN.
-        Returns new S16_LE bytes at ~16 kHz.
-        """
-        out = bytearray()
-        try:
-            for i, (s,) in enumerate(struct.iter_unpack("<h", raw_chunk)):
-                if i % STT_DECIM != 0:
-                    continue
-                v = s * STT_GAIN
-                if v > 32767:
-                    v = 32767
-                elif v < -32768:
-                    v = -32768
-                out += struct.pack("<h", int(v))
-        except Exception as e:
-            print("STT: error in _make_stt_chunk:", e, flush=True)
-            return b""
-        return bytes(out)
+    in_tx = False
+    last_above = 0.0
+    tx_start_time = None
 
     print(
-        f"PIPE: start; squelch={squelch_val}, STT allowed={stt_allowed}, "
+        f"PIPE: start; squelch={squelch}, STT allowed={stt_enabled}, "
         f"open_off={open_off}, close_off={close_off}",
-        flush=True,
+        flush=True
     )
-
-    # ---- TX detection for beeps (simple hang logic) ----
-    MIN_RMS_NOISE = 20.0       # below this is basically silence
-
-    HANG_SEC        = 0.7      # keep TX open this long after last "loud"
-    MIN_TX_DURATION = 0.7      # minimum duration to consider it a TX
-    MIN_TX_GAP      = 0.7      # gap between TXs
-    MIN_BEEP_INT    = 0.4      # minimum gap between beeps
-
-    tx_active        = False
-    tx_start_time    = 0.0
-    last_tx_end_time = 0.0
-    hang_until       = 0.0
-    last_beep_time   = 0.0
-
-    # adaptive noise floor (only learned when not in TX)
-    noise_floor = 0.0
-    alpha       = 0.98  # smoothing
 
     while True:
         with _proc_lock:
@@ -705,191 +751,84 @@ def _pipe_audio_loop():
 
         try:
             chunk = rtl.stdout.read(4096)
-        except Exception as e:
-            print("PIPE: read error:", e, flush=True)
+        except Exception:
             break
 
         if not chunk:
             break
 
-        # ---- RMS for detection / noise floor ----
-        n_samples = len(chunk) // 2
-        if n_samples <= 0:
-            continue
-
-        sum_sq = 0
+        # RMS on 16-bit mono audio
         try:
-            for (s,) in struct.iter_unpack("<h", chunk):
-                sum_sq += s * s
+            vals = [s[0] for s in struct.iter_unpack("<h", chunk)]
         except Exception:
-            sum_sq = 0
+            vals = []
 
-        rms = math.sqrt(sum_sq / n_samples) if n_samples > 0 else 0.0
+        if vals:
+            sq = sum(v*v for v in vals) / len(vals)
+            rms = math.sqrt(sq)
+        else:
+            rms = 0.0
+
         now = time.time()
 
-        # ---- Update noise floor (only when not TX and squelch>0) ----
-        if squelch_val > 0 and not tx_active:
-            if noise_floor == 0.0:
-                noise_floor = rms
-            else:
-                noise_floor = alpha * noise_floor + (1.0 - alpha) * rms
+        # Initialize / update noise floor when below threshold
+        if noise_floor == 0.0:
+            noise_floor = rms
+        # only update noise floor from quiet-ish chunks
+        if rms < noise_floor * 1.5:
+            noise_floor = (1.0 - noise_alpha) * noise_floor + noise_alpha * rms
 
-        if squelch_val > 0:
-            base = max(noise_floor, MIN_RMS_NOISE)
-            open_th  = base + float(open_off)
-            close_th = base + float(close_off)
-        else:
-            # squelch disabled → no TX detection / beeps
-            open_th = close_th = float("inf")
+        # Dynamic thresholds (offsets above noise floor)
+        open_th = noise_floor + (open_off if open_off > 0 else 0)
+        close_th = noise_floor + (close_off if close_off > 0 else open_off)
 
-        # ---- TX state machine (for beeps only) ----
-        if squelch_val > 0:
-            if not tx_active:
-                # consider starting TX if we cross open_th and had enough gap
-                if rms > open_th and (now - last_tx_end_time) >= MIN_TX_GAP:
-                    tx_active     = True
-                    tx_start_time = now
-                    hang_until    = now + HANG_SEC
-                    print(
-                        f"TX START: rms={rms:.1f}, noise_floor={noise_floor:.1f}, "
-                        f"open_th={open_th:.1f}, close_th={close_th:.1f}",
-                        flush=True,
-                    )
-            else:
-                # already in TX
-                if rms > close_th:
-                    # refresh hang timer while loud enough
-                    hang_until = now + HANG_SEC
+        # --- TX state machine ---
+        if not in_tx and rms >= open_th:
+            in_tx = True
+            tx_start_time = now
+            last_above = now
+            print(
+                f"TX START: rms={rms:.1f}, noise_floor={noise_floor:.1f}, "
+                f"open_th={open_th:.1f}, close_th={close_th:.1f}",
+                flush=True
+            )
 
-                tx_duration = now - tx_start_time
+        elif in_tx:
+            if rms >= close_th:
+                last_above = now
+            elif now - last_above >= HANG_SEC:
+                dur = now - (tx_start_time or now)
+                print(
+                    f"TX END: dur={dur:.2f}s, rms={rms:.1f}, "
+                    f"noise_floor={noise_floor:.1f}, open_th={open_th:.1f}, "
+                    f"close_th={close_th:.1f}",
+                    flush=True
+                )
+                # one beep at end-of-TX, only if squelch is active
+                if squelch > 0:
+                    try:
+                        aplay.stdin.write(beep_chunk)
+                        aplay.stdin.flush()
+                        print("BEEP: end-of-transmission", flush=True)
+                    except Exception:
+                        pass
+                in_tx = False
+                tx_start_time = None
+                last_above = 0.0
 
-                # end TX only after hang time + minimum duration
-                if now > hang_until and tx_duration >= MIN_TX_DURATION:
-                    tx_active        = False
-                    last_tx_end_time = now
-                    print(
-                        f"TX END: dur={tx_duration:.2f}s, rms={rms:.1f}, "
-                        f"noise_floor={noise_floor:.1f}, open_th={open_th:.1f}, "
-                        f"close_th={close_th:.1f}",
-                        flush=True,
-                    )
+        # --- STT path (continuous) ---
+        if stt_enabled and squelch > 0:
+            _stt_feed(chunk, stt_gain)
 
-                    # single beep at end of TX
-                    if now - last_beep_time >= MIN_BEEP_INT:
-                        try:
-                            aplay.stdin.write(beep_chunk)
-                            aplay.stdin.flush()
-                            print("BEEP: end-of-transmission", flush=True)
-                        except Exception as e:
-                            print("BEEP: write error:", e, flush=True)
-                        last_beep_time = now
-
-        # ---- Always forward original audio to aplay ----
+        # --- forward audio to speakers ---
         try:
             aplay.stdin.write(chunk)
             aplay.stdin.flush()
-        except Exception as e:
-            print("PIPE: aplay write error:", e, flush=True)
+        except Exception:
             break
-
-        # ---- Continuous STT feed (independent of TX) ----
-        if stt_allowed and recognizer is not None:
-            stt_chunk = _make_stt_chunk(chunk)
-            if stt_chunk:
-                ns = len(stt_chunk) // 2
-                stt_samples += ns
-                # debug RMS for STT stream
-                try:
-                    sum_sq_stt = 0
-                    for (s,) in struct.iter_unpack("<h", stt_chunk):
-                        sum_sq_stt += s * s
-                    stt_sum_sq += sum_sq_stt
-                except Exception:
-                    pass
-
-                try:
-                    if recognizer.AcceptWaveform(stt_chunk):
-                        res = recognizer.Result()
-                        try:
-                            data = json.loads(res) if res else {}
-                        except Exception:
-                            data = {}
-                        txt = (data.get("text") or "").strip()
-                        stt_rms = (
-                            math.sqrt(stt_sum_sq / stt_samples)
-                            if stt_samples > 0 else 0.0
-                        )
-                        print(
-                            f"STT: Result raw={data}, stt_samples={stt_samples}, "
-                            f"stt_rms={stt_rms:.1f}",
-                            flush=True,
-                        )
-                        if txt:
-                            entry = {
-                                "time": time.time(),
-                                "offset": stt_samples / float(STT_RATE)
-                                if STT_RATE > 0 else 0.0,
-                                "freq_hz": freq_hz,
-                                "text": txt,
-                                "final": True,
-                            }
-                            _transcripts.append(entry)
-                            if len(_transcripts) > 200:
-                                _transcripts = _transcripts[-200:]
-                            print("STT: stored transcript:", entry, flush=True)
-                        # reset STT energy stats each utterance
-                        stt_samples = 0
-                        stt_sum_sq  = 0.0
-                    else:
-                        # Optional: see partials for debugging
-                        # p = recognizer.PartialResult()
-                        # print("STT: partial:", p, flush=True)
-                        pass
-                except Exception as e:
-                    print("STT: AcceptWaveform error:", e, flush=True)
-                    with _proc_lock:
-                        state["stt_enabled"] = False
-                    recognizer = None
-                    stt_allowed = False
-
-    # ---- Flush STT on exit ----
-    if stt_allowed and recognizer is not None:
-        try:
-            final = recognizer.FinalResult()
-            try:
-                data = json.loads(final) if final else {}
-            except Exception:
-                data = {}
-            txt = (data.get("text") or "").strip()
-            stt_rms = (
-                math.sqrt(stt_sum_sq / stt_samples)
-                if stt_samples > 0 else 0.0
-            )
-            print(
-                f"STT: FinalResult on loop exit: raw={data}, "
-                f"stt_samples={stt_samples}, stt_rms={stt_rms:.1f}",
-                flush=True,
-            )
-            if txt:
-                entry = {
-                    "time": time.time(),
-                    "offset": stt_samples / float(STT_RATE)
-                    if STT_RATE > 0 else 0.0,
-                    "freq_hz": freq_hz,
-                    "text": txt,
-                    "final": True,
-                }
-                _transcripts.append(entry)
-                if len(_transcripts) > 200:
-                    _transcripts = _transcripts[-200:]
-                print("STT: stored transcript on exit:", entry, flush=True)
-        except Exception as e:
-            print("STT: FinalResult error on exit:", e, flush=True)
 
     with _proc_lock:
         _pipe_thread = None
-
-
 
 
 @app.route("/api/start", methods=["POST"])
@@ -897,31 +836,31 @@ def api_start():
     global _rtl_proc, _aplay_proc, _pipe_thread, _last_start
 
     data = request.get_json() or {}
+    print("API /start: state =", state, flush=True)
 
+    # Update state from payload
     for key in (
         "freq", "bandwidth", "modulation", "gain", "samplerate",
         "audio_device", "device_index", "squelch",
         "open_threshold", "close_threshold", "beep_freq",
-        "scan_start", "scan_end", "scan_step",
-        "stt_model_path",
+        "scan_start", "scan_end", "scan_step", "scan_freqlist",
+        "stt_enabled", "stt_model_path", "stt_gain",
     ):
         if key in data:
             if key == "modulation":
                 state["modulation"] = str(data[key]).lower()
                 continue
-            if isinstance(state[key], float):
+            if key in ("stt_model_path", "audio_device", "scan_freqlist"):
+                state[key] = str(data[key])
+            elif isinstance(state.get(key), float):
                 state[key] = float(data[key])
-            elif isinstance(state[key], int):
+            elif isinstance(state.get(key), int):
                 state[key] = int(data[key])
             else:
                 state[key] = data[key]
 
     if "scan_enabled" in data:
         state["scan_enabled"] = bool(data["scan_enabled"])
-    if "stt_enabled" in data:
-        state["stt_enabled"] = bool(data["stt_enabled"])
-
-    print("API /start: state =", state, flush=True)
 
     with _proc_lock:
         _stop_current_locked()
@@ -929,6 +868,7 @@ def api_start():
 
         rtl_cmd = build_rtl_cmd()
         aplay_cmd = build_aplay_cmd()
+
         state["last_rtl_cmd"] = rtl_cmd
         state["last_aplay_cmd"] = aplay_cmd
 
@@ -941,7 +881,6 @@ def api_start():
             )
         except Exception as e:
             _rtl_proc = None
-            print("Failed to start rtl_fm:", e, flush=True)
             return jsonify({"ok": False, "error": f"failed to start rtl_fm: {e}"}), 500
 
         print("Starting aplay:", aplay_cmd, flush=True)
@@ -953,7 +892,6 @@ def api_start():
                 stderr=subprocess.PIPE,
             )
         except Exception as e:
-            print("Failed to start aplay:", e, flush=True)
             try:
                 _rtl_proc.send_signal(signal.SIGINT)
             except Exception:
@@ -965,11 +903,16 @@ def api_start():
             _aplay_proc = None
             return jsonify({"ok": False, "error": f"failed to start aplay: {e}"}), 500
 
+        # Start audio pipe thread
         _pipe_thread = threading.Thread(target=_pipe_audio_loop, daemon=True)
         _pipe_thread.start()
 
         _last_start = time.time()
         state["running"] = True
+
+    # STT model load happens lazily in _pipe_audio_loop / _make_stt_recognizer
+    if state.get("stt_enabled") and _VOSK_OK:
+        threading.Thread(target=_ensure_stt_model, daemon=True).start()
 
     return jsonify({
         "ok": True,
@@ -1026,22 +969,14 @@ def api_volume():
 
 @app.route("/api/transcripts")
 def api_transcripts():
-    return jsonify({
-        "ok": True,
-        "transcripts": _transcripts,
-        "stt_enabled": state.get("stt_enabled", False),
-        "vosk_available": _vosk_available,
-    })
-
-
-@app.route("/api/transcripts/clear", methods=["POST"])
-def api_transcripts_clear():
-    global _transcripts
-    _transcripts = []
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "items": _transcripts})
 
 
 if __name__ == "__main__":
     print("Starting RTL-FM control server on :8080", flush=True)
+    if _VOSK_OK:
+        print("Vosk Python module available.", flush=True)
+    else:
+        print("Vosk not available in this container.", flush=True)
     set_volume(state["volume"])
     app.run(host="0.0.0.0", port=8080)

@@ -60,5 +60,6 @@ services:
       - "/dev/bus/usb:/dev/bus/usb"
       - "/dev/snd:/dev/snd"
     volumes:
-      - "/sys/bus/usb:/sys/bus/usb"
-      - "/home/pi/stt_models:/opt/models:ro"
+    - "/sys/bus/usb:/sys/bus/usb"
+    - "/home/pi/stt_models:/opt/models"    
+    - "/home/pi/recon-kit-data:/opt/data"
