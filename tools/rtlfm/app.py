@@ -7,6 +7,7 @@ import time
 import math
 import struct
 import json
+import re
 
 from flask import Flask, jsonify, request, render_template_string
 
@@ -24,6 +25,7 @@ app = Flask(__name__)
 _rtl_proc = None
 _aplay_proc = None
 _pipe_thread = None
+_stderr_thread = None
 _proc_lock = threading.Lock()
 _last_start = None
 
@@ -35,10 +37,14 @@ _stt_lock = threading.Lock()
 _transcripts = []  # list of dicts: {time, offset, freq_hz, text, final}
 _STT_MAX_ITEMS = 200
 
+# Live tuned frequency (updated from rtl_fm stderr)
+_current_freq_hz = None
+_current_freq_lock = threading.Lock()
+
 # Current settings / state
 state = {
     "running": False,
-    "freq": 453.45e6,        # Hz, default
+    "freq": 453.45e6,        # Hz, default (used when not scanning or when we can't detect)
     "bandwidth": 50e3,       # Hz, good for ~25 kHz FM channels
     "gain": 0,               # 0 = auto
     "samplerate": 48000,     # audio sample rate for aplay
@@ -49,20 +55,19 @@ state = {
     # Modulation (-M)
     "modulation": "fm",      # fm, wbfm, raw, am, usb, lsb
     # Beep / detection config
-    "open_threshold": 400,   # default offsets, not absolute
-    "close_threshold": 300,
+    "open_threshold": 1000,   # default offsets, not absolute
+    "close_threshold": 30,
     "beep_freq": 1000,       # Hz, tone for this SDR
     # rtl_fm built-in scan config (range)
     "scan_enabled": False,
     "scan_start": 453.0e6,   # Hz
     "scan_end": 454.0e6,     # Hz
     "scan_step": 25e3,       # Hz
-    # NEW: explicit comma-separated scan frequency list (MHz)
-    # If set, we pass multiple -f entries and ignore range scanning.
+    # Explicit comma-separated scan frequency list (MHz) -> multiple -f flags
     "scan_freqlist": "",
     # STT config
     "stt_enabled": True,
-    # Default to SMALL model (your request)
+    # Default to SMALL model
     "stt_model_path": "/opt/models/vosk-model-small-en-us-0.15",
     "stt_gain": 6.0,         # linear gain applied to STT audio path
     # Debug: last commands
@@ -263,6 +268,7 @@ async function refresh(){
     statusBox.innerHTML =
       `<b>Running:</b> ${s.running}<br>
        <b>Freq (display):</b> ${(s.freq/1e6).toFixed(3)} MHz<br>
+       <b>Current tuned:</b> ${s.current_freq_hz ? (s.current_freq_hz/1e6).toFixed(6) + ' MHz' : '(unknown)'}<br>
        <b>Bandwidth:</b> ${(s.bandwidth/1e3)} kHz<br>
        <b>Modulation (-M):</b> ${s.modulation}<br>
        <b>Gain:</b> ${s.gain}<br>
@@ -354,7 +360,7 @@ document.getElementById('start').onclick = async () => {
     scan_start: parseFloat(scanStartInput.value) * 1e6,
     scan_end: parseFloat(scanEndInput.value) * 1e6,
     scan_step: parseFloat(scanStepInput.value) * 1e3,
-    scan_freqlist: scanListInput.value,   // NEW
+    scan_freqlist: scanListInput.value,
 
     stt_enabled: sttEnabledInput.checked,
     stt_model_path: sttModelInput.value,
@@ -405,7 +411,7 @@ async function refreshTranscripts() {
     const r = await j('/api/transcripts');
     transBody.innerHTML = "";
     if (!r.ok || !r.items) return;
-    // NEWEST FIRST: take last 50, then reverse for newest-first display
+    // newest first
     const items = r.items.slice(-50).reverse();
     for (const t of items) {
       const tr = document.createElement('tr');
@@ -415,7 +421,7 @@ async function refreshTranscripts() {
 
       const d = new Date(t.time * 1000);
       tdTime.textContent = d.toLocaleTimeString();
-      tdFreq.textContent = (t.freq_hz/1e6).toFixed(3);
+      tdFreq.textContent = (t.freq_hz/1e6).toFixed(6);
       tdText.textContent = t.text;
 
       tr.appendChild(tdTime);
@@ -444,7 +450,7 @@ def index():
 
 @app.route("/api/status")
 def api_status():
-    global _rtl_proc, _aplay_proc
+    global _rtl_proc, _aplay_proc, _current_freq_hz
     with _proc_lock:
         rtl = _rtl_proc
         aplay = _aplay_proc
@@ -454,11 +460,15 @@ def api_status():
     running = rtl_ok and aplay_ok
     state["running"] = running
 
+    with _current_freq_lock:
+        cf = _current_freq_hz
+
     s = dict(state)
     s["pid_rtl"] = rtl.pid if rtl is not None else None
     s["pid_aplay"] = aplay.pid if aplay is not None else None
     s["last_start"] = _last_start
     s["stt_available"] = bool(_VOSK_OK)
+    s["current_freq_hz"] = cf
     return jsonify(s)
 
 
@@ -509,7 +519,6 @@ def build_rtl_cmd():
         "-E", "deemp",
     ]
 
-    # NEW: explicit list of frequencies (MHz, comma-separated)
     freqlist = (state.get("scan_freqlist") or "").strip()
     if freqlist:
         for token in freqlist.split(","):
@@ -559,7 +568,7 @@ def build_aplay_cmd():
 
 def _stop_current_locked():
     """Stop current rtl_fm + aplay; caller must hold _proc_lock."""
-    global _rtl_proc, _aplay_proc, _pipe_thread
+    global _rtl_proc, _aplay_proc, _pipe_thread, _stderr_thread
 
     if _rtl_proc is not None and _rtl_proc.poll() is None:
         try:
@@ -594,7 +603,12 @@ def _stop_current_locked():
     _aplay_proc = None
 
     _pipe_thread = None
+    _stderr_thread = None
     state["running"] = False
+
+    global _current_freq_hz
+    with _current_freq_lock:
+        _current_freq_hz = None
 
 
 def _ensure_stt_model():
@@ -619,7 +633,6 @@ def _ensure_stt_model():
     _stt_model_path_loaded = model_path
     print("STT: model loaded OK.", flush=True)
 
-    # recognizer created later in _make_stt_recognizer
     _stt_rec = None
     return True
 
@@ -651,7 +664,6 @@ def _stt_feed(chunk_48k: bytes, stt_gain: float):
         if rec is None:
             return
 
-        # Interpret as 16-bit little-endian mono @ 48kHz
         try:
             samples = list(struct.iter_unpack("<h", chunk_48k))
         except Exception:
@@ -660,7 +672,6 @@ def _stt_feed(chunk_48k: bytes, stt_gain: float):
         if not samples:
             return
 
-        # Downsample by 3 (48k -> 16k) and apply gain
         out = bytearray()
         for i in range(0, len(samples), 3):
             s = samples[i][0]
@@ -670,7 +681,6 @@ def _stt_feed(chunk_48k: bytes, stt_gain: float):
         if not out:
             return
 
-        # Feed into vosk
         if rec.AcceptWaveform(bytes(out)):
             res = rec.Result()
             try:
@@ -679,7 +689,6 @@ def _stt_feed(chunk_48k: bytes, stt_gain: float):
                 obj = {}
             text = (obj.get("text") or "").strip()
             if text:
-                # simple RMS-ish for debug
                 vals = [struct.unpack("<h", out[i:i+2])[0] for i in range(0, len(out), 2)]
                 stt_rms = (sum(v*v for v in vals)/len(vals))**0.5 if vals else 0.0
                 print(
@@ -688,17 +697,133 @@ def _stt_feed(chunk_48k: bytes, stt_gain: float):
                 )
                 _store_transcript(text)
         else:
-            # optional: could inspect PartialResult; ignoring for now
             pass
 
 
+def _parse_freq_to_hz(text: str):
+    """
+    Parse a frequency like '465.000000 MHz', '465 MHz', '465000000 Hz', '465 kHz', etc.
+    Returns Hz as float or None.
+    """
+    m = re.search(r'(?i)tuned to\s+([0-9.]+)\s*([kKmM]?Hz)?', text)
+    if not m:
+        m = re.search(r'([0-9.]+)\s*([kKmM]?Hz)', text)
+    if not m:
+        m = re.search(r'(?<![0-9.])([0-9]{6,})(?![0-9])', text)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                return None
+        return None
+
+    val = float(m.group(1))
+    unit = (m.group(2) or "").lower()
+    if unit in ("hz", ""):
+        return val
+    if unit == "khz":
+        return val * 1e3
+    if unit == "mhz":
+        return val * 1e6
+    return val
+
+
+def _rtl_stderr_reader():
+    """Read rtl_fm stderr and update current tuned frequency when it reports it."""
+    global _rtl_proc, _current_freq_hz
+    print("DBG: stderr reader started", flush=True)
+    buf = b""
+    while True:
+        with _proc_lock:
+            p = _rtl_proc
+        if p is None:
+            break
+        try:
+            chunk = p.stderr.read(256)
+        except Exception:
+            break
+        if not chunk:
+            time.sleep(0.05)
+            with _proc_lock:
+                if _rtl_proc is None or _rtl_proc.poll() is not None:
+                    break
+            continue
+
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            s = line.decode(errors="ignore").strip()
+            if not s:
+                continue
+
+            # *** print every stderr line so you can see what rtl_fm says ***
+            print(f"RTL_STDERR: {s}", flush=True)
+
+            hz = _parse_freq_to_hz(s)
+            if hz:
+                with _current_freq_lock:
+                    _current_freq_hz = hz
+                print(f"DBG: detected tuned frequency -> {hz/1e6:.6f} MHz", flush=True)
+
+    print("DBG: stderr reader exiting", flush=True)
+
+
+def _quantize_freq_for_log() -> float:
+    """
+    Map the raw tuned freq to a logical channel:
+
+    - If scan_freqlist is set, snap to nearest list entry (in Hz).
+    - Else if range scan is enabled, snap to nearest start + n*step bin.
+    - Else, fall back to current state['freq'] or raw tuned value.
+    """
+    global _current_freq_hz
+    with _current_freq_lock:
+        cf = _current_freq_hz
+
+    if cf is None:
+        return float(state.get("freq", 0.0))
+
+    slots = []
+
+    freqlist = (state.get("scan_freqlist") or "").strip()
+    if freqlist:
+        for token in freqlist.split(","):
+            t = token.strip()
+            if not t:
+                continue
+            try:
+                mhz = float(t)
+                slots.append(mhz * 1e6)
+            except Exception:
+                continue
+    elif state.get("scan_enabled", False):
+        start = float(state.get("scan_start", cf))
+        end = float(state.get("scan_end", cf))
+        step = float(state.get("scan_step", 25_000.0))
+        if step > 0 and end > start:
+            k = round((cf - start) / step)
+            fq = start + k * step
+            if fq < start:
+                fq = start
+            if fq > end:
+                fq = end
+            slots.append(fq)
+
+    if slots:
+        best = min(slots, key=lambda f: abs(f - cf))
+        return float(best)
+
+    return float(cf if cf is not None else state.get("freq", 0.0))
+
+
 def _store_transcript(text: str):
-    """Append one transcript entry, keep bounded length."""
+    """Append one transcript entry with logical channel freq."""
     global _transcripts
+    freq_for_log = _quantize_freq_for_log()
     item = {
         "time": time.time(),
-        "offset": 0.0,  # placeholder; could track stream offset later
-        "freq_hz": state.get("freq", 0.0),
+        "offset": 0.0,
+        "freq_hz": freq_for_log,
         "text": text,
         "final": True,
     }
@@ -709,12 +834,7 @@ def _store_transcript(text: str):
 
 
 def _pipe_audio_loop():
-    """
-    Forward PCM from rtl_fm -> aplay and:
-      - detect TX start/end based on dynamic thresholds
-      - beep once at end of TX
-      - optionally feed audio to Vosk STT (separate gain path)
-    """
+    """Forward PCM from rtl_fm -> aplay, detect TX, beep, and feed STT."""
     global _pipe_thread
 
     with _proc_lock:
@@ -757,7 +877,6 @@ def _pipe_audio_loop():
         if not chunk:
             break
 
-        # RMS on 16-bit mono audio
         try:
             vals = [s[0] for s in struct.iter_unpack("<h", chunk)]
         except Exception:
@@ -771,18 +890,14 @@ def _pipe_audio_loop():
 
         now = time.time()
 
-        # Initialize / update noise floor when below threshold
         if noise_floor == 0.0:
             noise_floor = rms
-        # only update noise floor from quiet-ish chunks
         if rms < noise_floor * 1.5:
             noise_floor = (1.0 - noise_alpha) * noise_floor + noise_alpha * rms
 
-        # Dynamic thresholds (offsets above noise floor)
         open_th = noise_floor + (open_off if open_off > 0 else 0)
         close_th = noise_floor + (close_off if close_off > 0 else open_off)
 
-        # --- TX state machine ---
         if not in_tx and rms >= open_th:
             in_tx = True
             tx_start_time = now
@@ -804,7 +919,6 @@ def _pipe_audio_loop():
                     f"close_th={close_th:.1f}",
                     flush=True
                 )
-                # one beep at end-of-TX, only if squelch is active
                 if squelch > 0:
                     try:
                         aplay.stdin.write(beep_chunk)
@@ -816,11 +930,9 @@ def _pipe_audio_loop():
                 tx_start_time = None
                 last_above = 0.0
 
-        # --- STT path (continuous) ---
         if stt_enabled and squelch > 0:
             _stt_feed(chunk, stt_gain)
 
-        # --- forward audio to speakers ---
         try:
             aplay.stdin.write(chunk)
             aplay.stdin.flush()
@@ -833,12 +945,11 @@ def _pipe_audio_loop():
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
-    global _rtl_proc, _aplay_proc, _pipe_thread, _last_start
+    global _rtl_proc, _aplay_proc, _pipe_thread, _stderr_thread, _last_start, _current_freq_hz
 
     data = request.get_json() or {}
     print("API /start: state =", state, flush=True)
 
-    # Update state from payload
     for key in (
         "freq", "bandwidth", "modulation", "gain", "samplerate",
         "audio_device", "device_index", "squelch",
@@ -903,14 +1014,17 @@ def api_start():
             _aplay_proc = None
             return jsonify({"ok": False, "error": f"failed to start aplay: {e}"}), 500
 
-        # Start audio pipe thread
+        with _current_freq_lock:
+            _current_freq_hz = None
+
         _pipe_thread = threading.Thread(target=_pipe_audio_loop, daemon=True)
         _pipe_thread.start()
+        _stderr_thread = threading.Thread(target=_rtl_stderr_reader, daemon=True)
+        _stderr_thread.start()
 
         _last_start = time.time()
         state["running"] = True
 
-    # STT model load happens lazily in _pipe_audio_loop / _make_stt_recognizer
     if state.get("stt_enabled") and _VOSK_OK:
         threading.Thread(target=_ensure_stt_model, daemon=True).start()
 
@@ -946,9 +1060,15 @@ def api_logs():
             rtl_err = b""
             aplay_err = b""
             if _rtl_proc is not None and _rtl_proc.stderr is not None:
-                rtl_err = _rtl_proc.stderr.read(4096)
+                try:
+                    rtl_err = _rtl_proc.stderr.read(4096)
+                except Exception:
+                    rtl_err = b""
             if _aplay_proc is not None and _aplay_proc.stderr is not None:
-                aplay_err = _aplay_proc.stderr.read(4096)
+                try:
+                    aplay_err = _aplay_proc.stderr.read(4096)
+                except Exception:
+                    aplay_err = b""
             return jsonify({
                 "ok": True,
                 "rtl_stderr": rtl_err.decode(errors="ignore"),
