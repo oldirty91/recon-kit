@@ -63,3 +63,24 @@ services:
     - "/sys/bus/usb:/sys/bus/usb"
     - "/home/pi/stt_models:/opt/models"    
     - "/home/pi/recon-kit-data:/opt/data"
+
+  gps:
+    build: ./tools/gps
+    container_name: recon-gps
+    restart: unless-stopped
+    # Give container access to the Pi UART
+    devices:
+      - "/dev/serial0:/dev/serial0"
+    environment:
+      - UART_DEV=/dev/serial0
+      - UART_BAUD=9600
+      - HTTP_PORT=8085
+      - NMEA_TCP_PORT=10110
+      - STALE_SEC=5
+      - WRITE_JSON=/run/gps/position.json
+      - DEFAULT_LAT=41.39
+      - DEFAULT_LON=-71.58
+      - DEFAULT_ALT=0.0
+    ports:
+      - "8085:8085"     # GPS web UI + JSON/SSE
+      - "10110:10110"   # Raw NMEA TCP stream
