@@ -1,0 +1,2 @@
+"Sysname"	"Control Channel List"	"Offset"	"NAC"	"Modulation"	"TGID Tags File"	"Whitelist"	"Blacklist"	"Center Frequency"
+"RISCON"	"853.0375,853.150,853.275,853.7125,851.850,852.400,852.675,853.5125,852.925,853.175,853.4125,853.875,857.3375,858.3125,859.3125,860.3125,769.6625,769.9375"	"0"	"0x190"	"CQPSK"	"riscon.tsv"	""	""	""

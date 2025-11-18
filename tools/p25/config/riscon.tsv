@@ -1,0 +1,285 @@
+2	Intercity FD
+3	Intercity PD
+21	RISP N Disp
+22	RISP N Car
+24	RISP N Tac 1
+23	RISP N Tac 2
+25	RISP S Disp
+27	RISP S Car
+16	State FMO
+1038	NRI Fire Chi
+1041	SRI Fire Chi
+1314	Tanker TF 1
+194	Lifepact Amb
+212	Fatima-St Joes
+220	Health 1
+221	Health 2
+222	Dept of HealthSW
+228	DMAT South
+232	Life Span 1
+234	RI Hosp Ops
+120	DEM PD Ops
+122	DEM Police
+10	EMA-1
+20	EMA
+4	Hospitals IO
+5	Transportation
+6	Marine TF 1
+7	Marine TF 2
+1018	South Zone 1
+1019	South Zone 2
+1022	WIDE AREA 7
+1023	WIDE AREA 8
+1024	PD Chase Interop
+1025	Inland Marine IO
+1037	South Zone 5
+1173	North Zone 1
+1174	North Zone 2
+1177	North Zone 5
+1185	Metro Zone 1
+1186	Metro Zone 2
+1187	Metro Zone 3
+1335	East Zone 1
+1336	East Zone 2
+1337	East Zone 3
+1033	TANK TF
+1034	HZT DC1
+1035	HZT DC2
+176	RIDOT Primary
+4421	RITBA - Pell Bdg
+274	VA Police
+186	RIPTA
+187	RIPTA
+188	RIPTA
+189	RIPTA
+190	RIPTA
+304	Quonset ANGB FD
+17	TF Green PD
+19	TF Green FD
+1126	URI PD
+1131	URI EMS
+1348	St George Sec
+10228	RISD Secuty
+10229	PROV COLL
+10230	RI COL SEC
+11001	BROWN UNIV
+11002	BROWN CAR
+11003	BROWN TAC
+12	METROWIDE2
+14	METROWIDE4
+70	TFC TRIBUNAL
+168	Red Cross 1
+169	Red Cross 2
+223	NURSING HM
+243	Slater Hosp Ops
+244	Slater Hosp Sec
+1042	WashCo FireG
+1479	WashCo FireS
+1712	BarringtnFD1
+1713	BarringtnFD2
+1715	BarringtonPD 1
+1716	BarringtonPD 2
+1744	Bristol FD
+1755	Bristol Harbor
+2003	Burrillville PD
+2004	Burrillville PD2
+2005	Burrillville PD3
+2006	Burrillville PD4
+2000	Burrillville FD
+2001	Burrillv FDTAC1
+2009	Burrillv FDTAC2
+2002	Burrillville EMS
+2007	BurrillvilleTown
+2008	Burrillville EMA
+2010	Burrillville DPW
+1838	CentFallsPD1
+1839	CentFallsPD2
+1835	CentFalls FD 1
+1836	CentFalls FD 2
+1425	CharlestownPD
+1427	Charlestown FD
+1429	Chastown EMS
+1483	Coventry PD
+1484	Coventry PD2
+1480	Coventry FD
+1500	Cranston FD Disp
+1501	Cranston FD FG2
+1502	Cranston FD FG3
+1503	Cranston FD FG4
+1504	Cranston FD Admi
+1520	Cumberland FD
+1523	Cumberland PD
+1776	E Greenwich FD
+1779	E Greenwich PD
+1869	E Prov PD 1
+1872	E Prov PD 2
+1870	E Prov PD 3
+1883	E Prov PD12
+1866	E Prov FD 1
+1867	E Prov FD 2
+1878	E Prov FD 3
+2064	Exeter FD-G
+1904	Foster Fire
+1939	Glocester PD
+1940	Glocester PD 2
+1936	Glocester FD
+1410	Hopkinton PD
+1100	Jamestown PD 1
+1101	Jamestown PD 2
+1108	Jamestown FD
+1120	Jamestown FG 1
+1121	Jamestown FG 2
+1114	Jamestown DPW
+1107	Jamestown School
+1619	Johnston PD
+1616	Johnston FD
+1617	Johnston FG
+1683	Lincoln Police
+1684	Lincoln Police 2
+1680	Lincoln Fire 1
+1681	Lincoln Fire 2
+1691	Lincoln Fire 3
+1682	Lincoln EMS
+1688	Lincoln EMA
+1687	Lincoln Townwide
+1692	Lincoln DPW
+1264	LittleCompPD
+1266	LittleCompFD
+1338	MiddletownPD
+1343	Middletown FD
+1345	MiddletownTW
+1001	Narrag PD 1
+1002	Narrag PD 2
+1003	Narrag PD 3
+1004	Narrag PD 4
+1005	Narrag PD 5
+1007	Narrag PD 7
+1008	Narrag PD 8
+1006	Narrag FD
+1012	Narrag FDFG1
+1013	Narrag FDFG2
+1016	Narrag FD AD
+1014	Narrag EMS
+1017	Narrag DPW
+1010	Narrag TownA
+1011	Narrag IOP
+1376	New Shore PD
+1300	Newport PD 1
+1302	Newport PD 2
+1304	Newport PD 4
+1307	Newport PD 7
+1308	Newport PD 8
+1303	Newport FD1
+1305	Newport FG1
+1306	Newport FG2
+1301	Newport FDT
+1291	Newport Water
+1293	Newport DPW
+1297	Newport Evnt
+1312	Newport CW
+1285	NKing PD 1
+1286	NKing PD 2
+1287	NKing PD 3
+1280	NKing Fire D
+1281	NKing Fire G
+1536	NorthPrv PD1
+1537	NorthPrv PD2
+1538	NorthPrv PD3
+1547	NorthPrv FDD
+1548	NorthPrv Fire 2
+1549	NorthPrv Fire 3
+1550	NorthPrv Fire 4
+1551	NorthPrv Fire 5
+1552	NorthPrv Fire 6
+1544	NorthPrv TownW 1
+1545	NorthPrv TownW 2
+1554	NorthPrv DPW
+1971	N Smithfd PD
+1968	N Smithfield FD
+1969	N Smithfield FD2
+1981	N Smithfield FD3
+1440	Pawtucket FD 1
+1441	Pawtucket FG
+1442	Pawtucket EMSTac
+1248	PortsmouthPD
+1253	Portsmouth FD
+1255	Portsmouth FG
+1262	Prudence Isl FD
+10000	PPD ATG
+10001	PPD CH 1
+10002	PPD CH 2
+10003	PPD CH 3
+10004	PPD CH-4
+10005	PPD DETEC 1
+10006	PPD T/A
+10007	PPD NARC 1
+10008	PPD NARC 2
+10009	PPD DETEC 2
+10010	PPD DETAIL 1
+10011	PPD DETAIL 2
+10012	PPD CORR SEC
+10013	PPD SRU
+10014	PPD ADMIN
+10100	PROV FD ATG
+10101	PFD DISPATCH
+10107	PFD CH-2 FG
+10108	PFD CH-3 FG
+10109	PFD CH-4 FG
+10102	PFD CH-5
+10103	PFD CH-6
+10104	PFD CH-7
+10110	PFD M/A 1
+10111	PFD M/A 2
+10112	PFD M/A 3
+10113	PFD Fireground 8
+10105	PFD ADMIN
+10106	PFD COMM
+10207	PROV DPW
+2035	Richmond PD
+2042	Chariho Reg HS
+1460	Scituate PD
+1463	Scituate FD
+1651	SmithfieldPD
+1652	Smfld PD 2
+1653	Smfld PD Det
+1654	Smfld PD Adm
+1661	Smfld PD Dtl
+1648	SmithfieldFD
+1655	Smfld Town
+1657	Smfld EMA
+1660	Smfld DPW
+1225	SKing PD 1
+1226	SKing PD 2
+1235	SKing PD 3
+1236	SKing PD 5
+1232	SKing FD Lnk
+1240	SKing Fire D
+1227	UnionFD FG 1
+1237	UnionFD FG 2
+1026	UnionFD Evnt
+1015	SKing EMS
+1316	Tiverton PD
+1315	Tiverton FD
+1162	Warwick FD
+1170	Warwick FG
+1805	W Greenwh PD
+1806	W GreenwichPD2
+1802	W Greenwich FD D
+1803	W Greenwich FD G
+1208	W Warwick FD
+1050	Westerly PD1
+1051	Westerly PD2
+1052	Westerly PD3
+1053	Westerly PD4
+1054	Westerly PD5
+1064	Westerly PD6
+1063	Westerly FD
+1072	Westerly PFE
+1082	Westerly EMS
+1363	Woonskt PD 1
+1364	Woonskt PD 2
+1360	Woonsocket FD D
+1361	Woonsocket FD 2
+1354	Woonskt FD 3
+1367	Woonskt City
+1368	Woonsocket PW

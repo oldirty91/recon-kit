@@ -84,3 +84,19 @@ services:
     ports:
       - "8085:8085"     # GPS web UI + JSON/SSE
       - "10110:10110"   # Raw NMEA TCP stream
+
+  p25:
+    build: ./tools/p25
+    container_name: recon-p25
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    volumes:
+    - ./tools/p25/config:/config
+    environment:
+      - TZ=America/New_York
+      # default settings; override from your "traffic controller" later
+      - OP25_RX_PY=/opt/op25/op25/gr-op25_repeater/apps/rx.py
+    ports:
+      - "9005:9005"
