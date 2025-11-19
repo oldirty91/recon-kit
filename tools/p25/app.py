@@ -6,14 +6,14 @@ import threading
 from pathlib import Path
 from typing import Optional, Dict, Any
 import re
-import time
-
+import csv
 
 from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
 # ---------- Paths / Config ----------
+
 OP25_RX = "/opt/op25/op25/gr-op25_repeater/apps/rx.py"
 OP25_APPS_DIR = "/opt/op25/op25/gr-op25_repeater/apps"
 OP25_TDMA_DIR = "/opt/op25/op25/gr-op25_repeater/apps/tdma"
@@ -21,23 +21,90 @@ OP25_PY_DIR = "/opt/op25/op25/gr-op25_repeater/python"
 OP25_TX_DIR = "/opt/op25/op25/gr-op25_repeater/apps/tx"  # for op25_c4fm_mod
 
 TRUNK_TSV = "/config/trunk.tsv"
-TALKGROUPS_TSV = "/config/riscon.tsv"   # talkgroups (used by trunking logic, not directly on cli)
+TALKGROUPS_TSV = "/config/riscon.tsv"   # talkgroup list
 
 LOG_DIR = Path("/var/log/op25")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 STDERR_LOG = LOG_DIR / "op25_stderr.log"
 
 DEFAULT_SAMPLE_RATE = 1000000  # 1 Msps
 DEFAULT_GAIN = 40
 DEFAULT_DEVICE_INDEX = 0
 
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-
 # ---------- State ----------
+
 _proc_lock = threading.Lock()
 _proc: Optional[subprocess.Popen] = None
 _last_cmd: Optional[Dict[str, Any]] = None
 _last_exit_code: Optional[int] = None
 
+# ---------- Talkgroup map ----------
+
+TGID_MAP: dict[int, str] = {}
+
+# In-memory ring buffer of recent TG events (persists while container is running)
+RECENT_TG_EVENTS: list = []
+RECENT_TG_LOCK = threading.Lock()
+
+
+def _load_talkgroup_map():
+    """
+    Load talkgroup names from /config/riscon.tsv into TGID_MAP.
+
+    Supports your simple 2-column TSV:
+        DEC <tab> AlphaTag
+
+    If you later switch to a Radioreference-style headered TSV,
+    this will still work as long as the first column is the DEC
+    and the second is some human-friendly name.
+    """
+    global TGID_MAP
+    tg_file = Path(TALKGROUPS_TSV)
+
+    if not tg_file.exists():
+        print("[p25] talkgroup file /config/riscon.tsv not found, TG names disabled", flush=True)
+        return
+
+    TGID_MAP.clear()
+    count = 0
+
+    try:
+        with tg_file.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f, delimiter="\t")
+
+            for row in reader:
+                if not row:
+                    continue
+
+                # First column should be DEC (numeric talkgroup ID)
+                dec_str = (row[0] or "").strip()
+                if not dec_str or not re.match(r"^\d+$", dec_str):
+                    # skip non-numeric / header-ish rows if they ever appear
+                    continue
+
+                try:
+                    tgid = int(dec_str)
+                except ValueError:
+                    continue
+
+                # Second column is your label (Alpha Tag)
+                name = ""
+                if len(row) > 1:
+                    name = (row[1] or "").strip()
+
+                if not name:
+                    name = f"TG {tgid}"
+
+                TGID_MAP[tgid] = name
+                count += 1
+
+        print(f"[p25] loaded {count} talkgroup entries from {tg_file}", flush=True)
+
+    except Exception as e:
+        print(f"[p25] failed to load talkgroup map: {e}", flush=True)
+
+
+# ---------- Subprocess monitor ----------
 
 def _monitor_proc(p: subprocess.Popen):
     """Background monitor: wait for process to exit and record exit code."""
@@ -65,11 +132,10 @@ def _build_cmd(device_index: int, sample_rate: int, lna_gain: int) -> Dict[str, 
         "-T", TRUNK_TSV,
         "-2",            # phase 2
         "--nocrypt",     # skip encrypted
-        # "-l", "http:0.0.0.0:8765",  # OP25 web UI
-        "-l", "8765",  # OP25 web UI
-        "-U",
-        "-O", "plughw:2,0",
-        "-v", "10",
+        "-l", "8765",    # OP25 terminal / HTTP port (no http:// prefix)
+        "-U",            # enable UDP audio
+        "-O", "plughw:2,0",  # ALSA output device on the Pi
+        "-v", "10",      # verbose so we see TG + radio IDs in the log
     ]
 
     return {
@@ -94,9 +160,10 @@ def healthz():
 def status():
     with _proc_lock:
         running = _proc is not None and _proc.poll() is None
+        pid = _proc.pid if running and _proc is not None else None
         return jsonify({
             "running": running,
-            "pid": _proc.pid if running and _proc else None,
+            "pid": pid,
             "last_exit_code": _last_exit_code,
             "last_config": _last_cmd,
         })
@@ -130,7 +197,7 @@ def start():
         STDERR_LOG.parent.mkdir(parents=True, exist_ok=True)
         stderr_f = open(STDERR_LOG, "ab", buffering=0)
 
-        # ---- Make sure all OP25 dirs are on PYTHONPATH ----
+        # Ensure all OP25 dirs are on PYTHONPATH
         env = os.environ.copy()
         extra_paths = [
             OP25_APPS_DIR,
@@ -142,13 +209,13 @@ def start():
         extra = ":".join(extra_paths)
         env["PYTHONPATH"] = extra + (":" + existing_py if existing_py else "")
 
-        # *** IMPORTANT: run from /config so 'riscon.tsv' is found ***
+        # run from /config so relative tsv paths work
         p = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=stderr_f,
             env=env,
-            cwd="/config",          # <--- this is the key line
+            cwd="/config",
         )
         _proc = p
 
@@ -163,7 +230,6 @@ def start():
             "pythonpath": env["PYTHONPATH"],
             "cwd": "/config",
         })
-
 
 
 @app.post("/stop")
@@ -194,24 +260,120 @@ def logs():
     except Exception as e:
         return jsonify({"lines": [], "error": str(e)}), 500
 
-# ---------- "Now Playing" (Talkgroup + Radio ID) ----------
 
-# Very loose regex patterns to catch common OP25 log formats.
-# We can tighten these once we see your actual log lines.
+# ---------- Talkgroup history / now-playing ----------
+
 _TG_PATTERNS = [
-    re.compile(r'\btgid[ =:]+(\d+)', re.I),
-    re.compile(r'\btg[ =:]+(\d+)', re.I),
+    re.compile(r"\btgid[ =:]+(\d+)", re.I),
+    re.compile(r"\btg[ =:]+(\d+)", re.I),
 ]
 _SRC_PATTERNS = [
-    re.compile(r'\bsrcaddr[ =:]+(\d+)', re.I),
-    re.compile(r'\bsrc[ =:]+(\d+)', re.I),
+    re.compile(r"\bsrcaddr[ =:]+(\d+)", re.I),
+    re.compile(r"\bsrc[ =:]+(\d+)", re.I),
 ]
+
+
+def _parse_tg_history_from_log(max_events: int = 200):
+    """
+    Update and return a persistent in-memory history of talkgroup events.
+
+    - Parses only the tail of the stderr log (last ~64kB).
+    - Extracts new TG/src events and appends them to RECENT_TG_EVENTS.
+    - Keeps only the last max_events items.
+    - If no new TG lines are found, we still return the existing history.
+    """
+    global RECENT_TG_EVENTS
+
+    # If there is no log file, just return whatever we have in memory
+    if not STDERR_LOG.exists():
+        with RECENT_TG_LOCK:
+            return list(RECENT_TG_EVENTS)
+
+    try:
+        with STDERR_LOG.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(0, size - 65536)  # last 64kB
+            f.seek(start, os.SEEK_SET)
+            chunk = f.read().decode(errors="replace")
+    except Exception:
+        # On read error, fall back to whatever we already have
+        with RECENT_TG_LOCK:
+            return list(RECENT_TG_EVENTS)
+
+    lines = chunk.splitlines()
+    new_events = []
+
+    for line in lines:
+        tgid = None
+        src = None
+
+        # Find talkgroup
+        for pat in _TG_PATTERNS:
+            m = pat.search(line)
+            if m:
+                try:
+                    tgid = int(m.group(1))
+                except ValueError:
+                    tgid = None
+                break
+
+        if tgid is None:
+            continue
+
+        # Find source (radio ID)
+        for pat in _SRC_PATTERNS:
+            m = pat.search(line)
+            if m:
+                try:
+                    src = int(m.group(1))
+                except ValueError:
+                    src = None
+                break
+
+        # crude timestamp: first two tokens if they look like MM/DD/YY HH:MM:SS...
+        timestamp = None
+        parts = line.split()
+        if len(parts) >= 2 and re.match(r"\d{2}/\d{2}/\d{2}", parts[0]):
+            timestamp = parts[0] + " " + parts[1]
+
+        label = TGID_MAP.get(tgid)
+
+        ev = {
+            "timestamp": timestamp,
+            "talkgroup": tgid,
+            "label": label,
+            "srcaddr": src,
+            "raw": line.strip(),
+        }
+        new_events.append(ev)
+
+    with RECENT_TG_LOCK:
+        # Build a set of existing keys so we don't spam duplicates every poll
+        existing_keys = {
+            (e.get("timestamp"), e.get("talkgroup"), e.get("srcaddr"))
+            for e in RECENT_TG_EVENTS
+        }
+
+        for ev in new_events:
+            key = (ev.get("timestamp"), ev.get("talkgroup"), ev.get("srcaddr"))
+            if key in existing_keys:
+                continue
+            RECENT_TG_EVENTS.append(ev)
+            existing_keys.add(key)
+
+        # Trim to last max_events
+        if len(RECENT_TG_EVENTS) > max_events:
+            RECENT_TG_EVENTS = RECENT_TG_EVENTS[-max_events:]
+
+        # Return a copy so callers can't mutate our buffer
+        return list(RECENT_TG_EVENTS)
+
 
 def _parse_nowplaying_from_log():
     """
-    Look at the end of the stderr log and try to pull out the latest
-    talkgroup + radio ID line.
-    Returns (tgid: int|None, srcaddr: int|None, raw_line: str|None).
+    Return the most recent talkgroup + src from the log.
+    (Still uses direct log tail; history uses the ring buffer.)
     """
     if not STDERR_LOG.exists():
         return None, None, None
@@ -220,7 +382,7 @@ def _parse_nowplaying_from_log():
         with STDERR_LOG.open("rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
-            start = max(0, size - 8192)  # last ~8kB
+            start = max(0, size - 8192)
             f.seek(start, os.SEEK_SET)
             chunk = f.read().decode(errors="replace")
     except Exception:
@@ -228,39 +390,45 @@ def _parse_nowplaying_from_log():
 
     lines = chunk.splitlines()
     tgid = None
-    srcaddr = None
-    raw_line = None
+    src = None
+    raw = None
 
-    # Walk backwards looking for the most recent line with a TG
     for line in reversed(lines):
         if tgid is None:
             for pat in _TG_PATTERNS:
                 m = pat.search(line)
                 if m:
-                    tgid = int(m.group(1))
-                    raw_line = line
+                    try:
+                        tgid = int(m.group(1))
+                    except ValueError:
+                        tgid = None
+                    raw = line
                     break
 
-        if srcaddr is None:
+        if src is None:
             for pat in _SRC_PATTERNS:
                 m = pat.search(line)
                 if m:
-                    srcaddr = int(m.group(1))
-                    # don't break; we still want tgid if not found yet
+                    try:
+                        src = int(m.group(1))
+                    except ValueError:
+                        src = None
                     break
 
         if tgid is not None:
-            # Good enough; we found a TG line
             break
 
-    return tgid, srcaddr, raw_line
+    return tgid, src, raw
+
+
+@app.get("/history")
+def history():
+    events = _parse_tg_history_from_log(max_events=200)
+    return jsonify({"events": events})
 
 
 @app.get("/nowplaying")
 def nowplaying():
-    """
-    Return the most recent talkgroup + radio ID seen in the log.
-    """
     tgid, srcaddr, raw = _parse_nowplaying_from_log()
     if tgid is None:
         return jsonify({
@@ -269,9 +437,6 @@ def nowplaying():
             "raw": None,
             "age_seconds": None,
         })
-
-    # We don’t have an exact timestamp from the log without parsing it,
-    # so just return "0" (just now) for now; we can refine later if needed.
     return jsonify({
         "talkgroup": tgid,
         "srcaddr": srcaddr,
@@ -301,7 +466,21 @@ INDEX_HTML = """
     .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.8rem; }
     .badge.ok { background: #2b6; }
     .badge.err { background: #b33; }
-    .nowplaying { margin-bottom: 1rem; padding: 1rem; background: #222; border-radius: 8px; }
+    .nowplaying {
+      margin-bottom: 1rem;
+      padding: 1rem;
+      background: #222;
+      border-radius: 8px;
+    }
+    .nowplaying pre {
+      max-height: 240px;
+      overflow-y: auto;
+      background: #111;
+      padding: 0.5rem;
+      border-radius: 4px;
+      font-size: 0.8rem;
+      line-height: 1.3;
+    }
   </style>
 </head>
 <body>
@@ -329,7 +508,7 @@ INDEX_HTML = """
   </div>
 
   <div class="nowplaying">
-    <h2>Now Playing</h2>
+    <h2>Now Playing (History)</h2>
     <pre id="nowplaying">Idle / no recent voice traffic</pre>
   </div>
 
@@ -427,30 +606,46 @@ async function stop() {
 
 async function refreshNowPlaying() {
   try {
-    const r = await fetch('/nowplaying');
+    const r = await fetch('/history');
     const j = await r.json();
     const el = document.getElementById('nowplaying');
 
-    if (!j.talkgroup) {
-      el.textContent = 'Idle / no recent voice traffic';
+    if (!j.events || j.events.length === 0) {
+      el.textContent = 'No recent voice activity';
       return;
     }
 
-    let line = `TG ${j.talkgroup}`;
-    if (j.srcaddr) {
-      line += `    Radio ${j.srcaddr}`;
-    }
-    if (j.age_seconds != null) {
-      line += `    • ${j.age_seconds.toFixed(1)}s ago`;
-    }
+    const events = j.events || [];
 
-    el.textContent = line + (j.raw ? `\n${j.raw}` : '');
+    // newest first
+    const lines = events.slice().reverse().map(ev => {
+      const parts = [];
+
+      if (ev.timestamp) {
+        parts.push(ev.timestamp);
+      }
+
+      if (ev.talkgroup) {
+        let tgText = `TG ${ev.talkgroup}`;
+        if (ev.label) {
+          tgText += ` (${ev.label})`;
+        }
+        parts.push(tgText);
+      }
+
+      if (ev.srcaddr) {
+        parts.push(`Radio ${ev.srcaddr}`);
+      }
+
+      return parts.join('  •  ');
+    });
+
+    el.textContent = lines.join('\\n');
   } catch (e) {
     const el = document.getElementById('nowplaying');
     el.textContent = 'error: ' + e;
   }
 }
-
 
 setInterval(refreshStatus, 2000);
 setInterval(refreshLogs, 2000);
@@ -471,4 +666,5 @@ def index():
 
 
 if __name__ == "__main__":
+    _load_talkgroup_map()
     app.run(host="0.0.0.0", port=9005)

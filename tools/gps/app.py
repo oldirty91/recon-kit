@@ -365,7 +365,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
         const hasFix = !!snap.fix;
         elFix.textContent = hasFix ? "LOCKED" : "NO FIX";
-        elFix.className = "value " + (hasFix ? "fix-true" : "fix-false";
+        elFix.className = "value " + (hasFix ? "fix-true" : "fix-false");
 
         if (typeof snap.age_sec === "number") {
             elAge.textContent = snap.age_sec.toFixed(1);
@@ -410,6 +410,8 @@ HTML_PAGE = """<!DOCTYPE html>
 
 
 class HTTP(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # ensure SSE friendliness
+
     def _send_bytes(self, code, payload: bytes, content_type: str):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
