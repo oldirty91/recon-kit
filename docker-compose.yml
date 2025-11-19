@@ -94,6 +94,7 @@ services:
       - /dev/bus/usb:/dev/bus/usb
     volumes:
     - ./tools/p25/config:/config
+    - ./tools/p25/app.py:/opt/p25/app.py:ro 
     environment:
       - TZ=America/New_York
       # default settings; override from your "traffic controller" later

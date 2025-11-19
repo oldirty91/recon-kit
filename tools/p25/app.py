@@ -5,6 +5,9 @@ import subprocess
 import threading
 from pathlib import Path
 from typing import Optional, Dict, Any
+import re
+import time
+
 
 from flask import Flask, jsonify, request, Response
 
@@ -65,7 +68,8 @@ def _build_cmd(device_index: int, sample_rate: int, lna_gain: int) -> Dict[str, 
         # "-l", "http:0.0.0.0:8765",  # OP25 web UI
         "-l", "8765",  # OP25 web UI
         "-U",
-        "-O", "plughw:2,0"
+        "-O", "plughw:2,0",
+        "-v", "10",
     ]
 
     return {
@@ -190,6 +194,91 @@ def logs():
     except Exception as e:
         return jsonify({"lines": [], "error": str(e)}), 500
 
+# ---------- "Now Playing" (Talkgroup + Radio ID) ----------
+
+# Very loose regex patterns to catch common OP25 log formats.
+# We can tighten these once we see your actual log lines.
+_TG_PATTERNS = [
+    re.compile(r'\btgid[ =:]+(\d+)', re.I),
+    re.compile(r'\btg[ =:]+(\d+)', re.I),
+]
+_SRC_PATTERNS = [
+    re.compile(r'\bsrcaddr[ =:]+(\d+)', re.I),
+    re.compile(r'\bsrc[ =:]+(\d+)', re.I),
+]
+
+def _parse_nowplaying_from_log():
+    """
+    Look at the end of the stderr log and try to pull out the latest
+    talkgroup + radio ID line.
+    Returns (tgid: int|None, srcaddr: int|None, raw_line: str|None).
+    """
+    if not STDERR_LOG.exists():
+        return None, None, None
+
+    try:
+        with STDERR_LOG.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(0, size - 8192)  # last ~8kB
+            f.seek(start, os.SEEK_SET)
+            chunk = f.read().decode(errors="replace")
+    except Exception:
+        return None, None, None
+
+    lines = chunk.splitlines()
+    tgid = None
+    srcaddr = None
+    raw_line = None
+
+    # Walk backwards looking for the most recent line with a TG
+    for line in reversed(lines):
+        if tgid is None:
+            for pat in _TG_PATTERNS:
+                m = pat.search(line)
+                if m:
+                    tgid = int(m.group(1))
+                    raw_line = line
+                    break
+
+        if srcaddr is None:
+            for pat in _SRC_PATTERNS:
+                m = pat.search(line)
+                if m:
+                    srcaddr = int(m.group(1))
+                    # don't break; we still want tgid if not found yet
+                    break
+
+        if tgid is not None:
+            # Good enough; we found a TG line
+            break
+
+    return tgid, srcaddr, raw_line
+
+
+@app.get("/nowplaying")
+def nowplaying():
+    """
+    Return the most recent talkgroup + radio ID seen in the log.
+    """
+    tgid, srcaddr, raw = _parse_nowplaying_from_log()
+    if tgid is None:
+        return jsonify({
+            "talkgroup": None,
+            "srcaddr": None,
+            "raw": None,
+            "age_seconds": None,
+        })
+
+    # We don’t have an exact timestamp from the log without parsing it,
+    # so just return "0" (just now) for now; we can refine later if needed.
+    return jsonify({
+        "talkgroup": tgid,
+        "srcaddr": srcaddr,
+        "raw": raw,
+        "age_seconds": 0.0,
+    })
+
 
 # ---------- Simple Web GUI ----------
 
@@ -212,6 +301,7 @@ INDEX_HTML = """
     .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.8rem; }
     .badge.ok { background: #2b6; }
     .badge.err { background: #b33; }
+    .nowplaying { margin-bottom: 1rem; padding: 1rem; background: #222; border-radius: 8px; }
   </style>
 </head>
 <body>
@@ -236,6 +326,11 @@ INDEX_HTML = """
       <button class="stop" onclick="stop()">Stop</button>
       <span id="health" class="badge">health: ?</span>
     </div>
+  </div>
+
+  <div class="nowplaying">
+    <h2>Now Playing</h2>
+    <pre id="nowplaying">Idle / no recent voice traffic</pre>
   </div>
 
   <div class="status">
@@ -330,12 +425,41 @@ async function stop() {
   refreshStatus();
 }
 
+async function refreshNowPlaying() {
+  try {
+    const r = await fetch('/nowplaying');
+    const j = await r.json();
+    const el = document.getElementById('nowplaying');
+
+    if (!j.talkgroup) {
+      el.textContent = 'Idle / no recent voice traffic';
+      return;
+    }
+
+    let line = `TG ${j.talkgroup}`;
+    if (j.srcaddr) {
+      line += `    Radio ${j.srcaddr}`;
+    }
+    if (j.age_seconds != null) {
+      line += `    • ${j.age_seconds.toFixed(1)}s ago`;
+    }
+
+    el.textContent = line + (j.raw ? `\n${j.raw}` : '');
+  } catch (e) {
+    const el = document.getElementById('nowplaying');
+    el.textContent = 'error: ' + e;
+  }
+}
+
+
 setInterval(refreshStatus, 2000);
 setInterval(refreshLogs, 2000);
 setInterval(refreshHealth, 5000);
+setInterval(refreshNowPlaying, 1000);
 refreshStatus();
 refreshLogs();
 refreshHealth();
+refreshNowPlaying();
 </script>
 </body>
 </html>
