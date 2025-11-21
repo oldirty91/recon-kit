@@ -410,12 +410,14 @@ HTML_PAGE = """<!DOCTYPE html>
 
 
 class HTTP(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"  # ensure SSE friendliness
+    protocol_version = "HTTP/1.1"  # SSE-friendly
 
     def _send_bytes(self, code, payload: bytes, content_type: str):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
+        # For non-SSE responses, close after sending
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -424,7 +426,7 @@ class HTTP(BaseHTTPRequestHandler):
         self._send_bytes(code, b, "application/json")
 
     def log_message(self, fmt, *args):
-        # Keep logs quiet; comment this out if you want HTTP logs.
+        # Keep logs quiet; comment out to debug HTTP
         return
 
     def do_GET(self):
@@ -452,6 +454,7 @@ class HTTP(BaseHTTPRequestHandler):
 
         # Server-Sent Events stream for live updates
         if self.path.startswith("/stream"):
+            # Long-lived, don't set Content-Length or Connection: close
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -477,8 +480,14 @@ class HTTP(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
 
+# --- Threaded HTTP server so multiple /stream clients can coexist ----
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 def start_http():
-    httpd = HTTPServer(("0.0.0.0", HTTP_PORT), HTTP)
+    httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), HTTP)
     print(f"[gps] HTTP server listening on :{HTTP_PORT}", flush=True)
     httpd.serve_forever()
 

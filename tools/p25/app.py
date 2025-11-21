@@ -38,13 +38,12 @@ _proc: Optional[subprocess.Popen] = None
 _last_cmd: Optional[Dict[str, Any]] = None
 _last_exit_code: Optional[int] = None
 
+# Per-decoder mute (does NOT touch global ALSA)
+_muted: bool = False
+
 # ---------- Talkgroup map ----------
 
-TGID_MAP: dict[int, str] = {}
-
-# In-memory ring buffer of recent TG events (persists while container is running)
-RECENT_TG_EVENTS: list = []
-RECENT_TG_LOCK = threading.Lock()
+TGID_MAP: Dict[int, str] = {}
 
 
 def _load_talkgroup_map():
@@ -79,7 +78,7 @@ def _load_talkgroup_map():
                 # First column should be DEC (numeric talkgroup ID)
                 dec_str = (row[0] or "").strip()
                 if not dec_str or not re.match(r"^\d+$", dec_str):
-                    # skip non-numeric / header-ish rows if they ever appear
+                    # skip non-numeric / header-ish rows
                     continue
 
                 try:
@@ -115,12 +114,23 @@ def _monitor_proc(p: subprocess.Popen):
         _proc = None
 
 
-def _build_cmd(device_index: int, sample_rate: int, lna_gain: int) -> Dict[str, Any]:
+def _build_cmd(
+    device_index: int,
+    sample_rate: int,
+    lna_gain: int,
+    muted: bool = False,
+) -> Dict[str, Any]:
     """
     Build the rx.py command line.
     Use osmosdr-style args: rtl=<index>, no separate -d.
+
+    If muted=True, send audio to a null sink instead of the Pi's ALSA device.
     """
     args_str = f"rtl={device_index}"
+
+    # When muted, send audio to a dummy sink; when unmuted, to the Pi card.
+    # You can change "null" to another ALSA sink if you like.
+    audio_dev = "null" if muted else "plughw:2,0"
 
     cmd = [
         "python3",
@@ -132,9 +142,9 @@ def _build_cmd(device_index: int, sample_rate: int, lna_gain: int) -> Dict[str, 
         "-T", TRUNK_TSV,
         "-2",            # phase 2
         "--nocrypt",     # skip encrypted
-        "-l", "8765",    # OP25 terminal / HTTP port (no http:// prefix)
+        "-l", "8765",    # OP25 terminal / HTTP port
         "-U",            # enable UDP audio
-        "-O", "plughw:2,0",  # ALSA output device on the Pi
+        "-O", audio_dev, # ALSA / audio sink (null when muted)
         "-v", "10",      # verbose so we see TG + radio IDs in the log
     ]
 
@@ -166,6 +176,7 @@ def status():
             "pid": pid,
             "last_exit_code": _last_exit_code,
             "last_config": _last_cmd,
+            "muted": _muted,
         })
 
 
@@ -189,7 +200,7 @@ def start():
         if _proc is not None and _proc.poll() is None:
             return jsonify({"error": "op25 already running"}), 409
 
-        cfg = _build_cmd(device_index, sample_rate, lna_gain)
+        cfg = _build_cmd(device_index, sample_rate, lna_gain, muted=_muted)
         cmd = cfg["cmd"]
         _last_cmd = cfg
         _last_exit_code = None
@@ -229,6 +240,7 @@ def start():
             "stderr_path": str(STDERR_LOG),
             "pythonpath": env["PYTHONPATH"],
             "cwd": "/config",
+            "muted": _muted,
         })
 
 
@@ -272,177 +284,217 @@ _SRC_PATTERNS = [
     re.compile(r"\bsrc[ =:]+(\d+)", re.I),
 ]
 
-
-def _parse_tg_history_from_log(max_events: int = 200):
-    """
-    Update and return a persistent in-memory history of talkgroup events.
-
-    - Parses only the tail of the stderr log (last ~64kB).
-    - Extracts new TG/src events and appends them to RECENT_TG_EVENTS.
-    - Keeps only the last max_events items.
-    - If no new TG lines are found, we still return the existing history.
-    """
-    global RECENT_TG_EVENTS
-
-    # If there is no log file, just return whatever we have in memory
-    if not STDERR_LOG.exists():
-        with RECENT_TG_LOCK:
-            return list(RECENT_TG_EVENTS)
-
-    try:
-        with STDERR_LOG.open("rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            start = max(0, size - 65536)  # last 64kB
-            f.seek(start, os.SEEK_SET)
-            chunk = f.read().decode(errors="replace")
-    except Exception:
-        # On read error, fall back to whatever we already have
-        with RECENT_TG_LOCK:
-            return list(RECENT_TG_EVENTS)
-
-    lines = chunk.splitlines()
-    new_events = []
-
-    for line in lines:
-        tgid = None
-        src = None
-
-        # Find talkgroup
-        for pat in _TG_PATTERNS:
-            m = pat.search(line)
-            if m:
-                try:
-                    tgid = int(m.group(1))
-                except ValueError:
-                    tgid = None
-                break
-
-        if tgid is None:
-            continue
-
-        # Find source (radio ID)
-        for pat in _SRC_PATTERNS:
-            m = pat.search(line)
-            if m:
-                try:
-                    src = int(m.group(1))
-                except ValueError:
-                    src = None
-                break
-
-        # crude timestamp: first two tokens if they look like MM/DD/YY HH:MM:SS...
-        timestamp = None
-        parts = line.split()
-        if len(parts) >= 2 and re.match(r"\d{2}/\d{2}/\d{2}", parts[0]):
-            timestamp = parts[0] + " " + parts[1]
-
-        label = TGID_MAP.get(tgid)
-
-        ev = {
-            "timestamp": timestamp,
-            "talkgroup": tgid,
-            "label": label,
-            "srcaddr": src,
-            "raw": line.strip(),
-        }
-        new_events.append(ev)
-
-    with RECENT_TG_LOCK:
-        # Build a set of existing keys so we don't spam duplicates every poll
-        existing_keys = {
-            (e.get("timestamp"), e.get("talkgroup"), e.get("srcaddr"))
-            for e in RECENT_TG_EVENTS
-        }
-
-        for ev in new_events:
-            key = (ev.get("timestamp"), ev.get("talkgroup"), ev.get("srcaddr"))
-            if key in existing_keys:
-                continue
-            RECENT_TG_EVENTS.append(ev)
-            existing_keys.add(key)
-
-        # Trim to last max_events
-        if len(RECENT_TG_EVENTS) > max_events:
-            RECENT_TG_EVENTS = RECENT_TG_EVENTS[-max_events:]
-
-        # Return a copy so callers can't mutate our buffer
-        return list(RECENT_TG_EVENTS)
+# In-memory persistent history: newest last
+TG_HISTORY: list[Dict[str, Any]] = []
+TG_HISTORY_MAX = 200
+_LOG_READ_POS: int = 0
+_LOG_INODE: Optional[int] = None
 
 
-def _parse_nowplaying_from_log():
-    """
-    Return the most recent talkgroup + src from the log.
-    (Still uses direct log tail; history uses the ring buffer.)
-    """
-    if not STDERR_LOG.exists():
-        return None, None, None
-
-    try:
-        with STDERR_LOG.open("rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            start = max(0, size - 8192)
-            f.seek(start, os.SEEK_SET)
-            chunk = f.read().decode(errors="replace")
-    except Exception:
-        return None, None, None
-
-    lines = chunk.splitlines()
+def _parse_line_to_event(line: str) -> Optional[Dict[str, Any]]:
+    """Parse a single stderr line into a talkgroup event dict, or None."""
     tgid = None
     src = None
-    raw = None
 
-    for line in reversed(lines):
-        if tgid is None:
-            for pat in _TG_PATTERNS:
-                m = pat.search(line)
-                if m:
-                    try:
-                        tgid = int(m.group(1))
-                    except ValueError:
-                        tgid = None
-                    raw = line
-                    break
-
-        if src is None:
-            for pat in _SRC_PATTERNS:
-                m = pat.search(line)
-                if m:
-                    try:
-                        src = int(m.group(1))
-                    except ValueError:
-                        src = None
-                    break
-
-        if tgid is not None:
+    for pat in _TG_PATTERNS:
+        m = pat.search(line)
+        if m:
+            try:
+                tgid = int(m.group(1))
+            except ValueError:
+                tgid = None
             break
 
-    return tgid, src, raw
+    if tgid is None:
+        return None
+
+    for pat in _SRC_PATTERNS:
+        m = pat.search(line)
+        if m:
+            try:
+                src = int(m.group(1))
+            except ValueError:
+                src = None
+            break
+
+    timestamp = None
+    parts = line.split()
+    if len(parts) >= 2 and re.match(r"\d{2}/\d{2}/\d{2}", parts[0]):
+        timestamp = parts[0] + " " + parts[1]
+
+    label = TGID_MAP.get(tgid)
+
+    return {
+        "timestamp": timestamp,
+        "talkgroup": tgid,
+        "label": label,
+        "srcaddr": src,
+        "raw": line.strip(),
+    }
+
+
+def _update_history_from_log():
+    """
+    Incrementally read new lines from STDERR_LOG and append talkgroup events
+    into TG_HISTORY, trimming to TG_HISTORY_MAX.
+    """
+    global _LOG_READ_POS, _LOG_INODE, TG_HISTORY
+
+    if not STDERR_LOG.exists():
+        return
+
+    try:
+        with STDERR_LOG.open("rb") as f:
+            st = os.fstat(f.fileno())
+            inode = st.st_ino
+            size = st.st_size
+
+            # Detect rotation / truncation
+            if _LOG_INODE is None or inode != _LOG_INODE or _LOG_READ_POS > size:
+                _LOG_INODE = inode
+                _LOG_READ_POS = 0
+
+            f.seek(_LOG_READ_POS)
+            chunk = f.read().decode(errors="replace")
+            _LOG_READ_POS = f.tell()
+    except Exception:
+        return
+
+    if not chunk:
+        return
+
+    for line in chunk.splitlines():
+        ev = _parse_line_to_event(line)
+        if ev is not None:
+            TG_HISTORY.append(ev)
+            if len(TG_HISTORY) > TG_HISTORY_MAX:
+                TG_HISTORY = TG_HISTORY[-TG_HISTORY_MAX:]
 
 
 @app.get("/history")
 def history():
-    events = _parse_tg_history_from_log(max_events=200)
-    return jsonify({"events": events})
+    _update_history_from_log()
+    # Return a copy so we don't leak internal mutable list
+    return jsonify({"events": TG_HISTORY})
 
 
 @app.get("/nowplaying")
 def nowplaying():
-    tgid, srcaddr, raw = _parse_nowplaying_from_log()
-    if tgid is None:
+    _update_history_from_log()
+    if not TG_HISTORY:
         return jsonify({
             "talkgroup": None,
             "srcaddr": None,
+            "label": None,
             "raw": None,
             "age_seconds": None,
         })
+
+    ev = TG_HISTORY[-1]
     return jsonify({
-        "talkgroup": tgid,
-        "srcaddr": srcaddr,
-        "raw": raw,
-        "age_seconds": 0.0,
+        "talkgroup": ev.get("talkgroup"),
+        "srcaddr": ev.get("srcaddr"),
+        "label": ev.get("label"),
+        "raw": ev.get("raw"),
+        "age_seconds": 0.0,  # we’re not doing precise timing here yet
     })
+
+
+# ---------- Mute endpoint (per-decoder) ----------
+
+@app.post("/mute")
+def mute():
+    """
+    Set or toggle mute state for OP25 *only* (does not touch global ALSA).
+
+    Request body:
+      { "mute": true }   -> force mute
+      { "mute": false }  -> force unmute
+      {}                 -> toggle
+    """
+    global _muted, _proc, _last_cmd, _last_exit_code
+
+    data = request.get_json(silent=True) or {}
+
+    if "mute" in data:
+        new_state = bool(data["mute"])
+    else:
+        new_state = not _muted  # toggle
+
+    with _proc_lock:
+        prev_state = _muted
+        _muted = new_state
+
+        # If not running, just update state and return.
+        if _proc is None or _proc.poll() is not None:
+            return jsonify({
+                "muted": _muted,
+                "restarted": False,
+                "running": False,
+                "note": "state updated; decoder not running",
+            })
+
+        # We *are* running: restart rx.py with new audio device
+        overrides = (_last_cmd or {}).get("overrides", {}) if _last_cmd else {}
+        device_index = int(overrides.get("device_index", DEFAULT_DEVICE_INDEX))
+        sample_rate = int(overrides.get("sample_rate", DEFAULT_SAMPLE_RATE))
+        lna_gain = int(overrides.get("lna_gain", DEFAULT_GAIN))
+
+        try:
+            # Stop old process
+            _proc.terminate()
+            try:
+                _proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _proc.kill()
+
+            # Build new command with updated mute state
+            cfg = _build_cmd(device_index, sample_rate, lna_gain, muted=_muted)
+            cmd = cfg["cmd"]
+            _last_cmd = cfg
+            _last_exit_code = None
+
+            STDERR_LOG.parent.mkdir(parents=True, exist_ok=True)
+            stderr_f = open(STDERR_LOG, "ab", buffering=0)
+
+            env = os.environ.copy()
+            extra_paths = [
+                OP25_APPS_DIR,
+                OP25_TDMA_DIR,
+                OP25_PY_DIR,
+                OP25_TX_DIR,
+            ]
+            existing_py = env.get("PYTHONPATH", "")
+            extra = ":".join(extra_paths)
+            env["PYTHONPATH"] = extra + (":" + existing_py if existing_py else "")
+
+            p = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_f,
+                env=env,
+                cwd="/config",
+            )
+            _proc = p
+
+            t = threading.Thread(target=_monitor_proc, args=(p,), daemon=True)
+            t.start()
+
+            return jsonify({
+                "muted": _muted,
+                "restarted": True,
+                "running": True,
+                "pid": p.pid,
+                "cmd": cmd,
+            })
+        except Exception as e:
+            # Roll back mute flag if restart fails
+            _muted = prev_state
+            return jsonify({
+                "muted": _muted,
+                "error": str(e),
+                "restarted": False,
+            }), 500
 
 
 # ---------- Simple Web GUI ----------
@@ -456,14 +508,45 @@ INDEX_HTML = """
   <style>
     body { font-family: sans-serif; padding: 1rem; background: #111; color: #eee; }
     h1 { margin-top: 0; }
-    .controls, .status, .logs, .help { margin-bottom: 1rem; padding: 1rem; background: #222; border-radius: 8px; }
+    .controls, .status, .logs, .help {
+      margin-bottom: 1rem;
+      padding: 1rem;
+      background: #222;
+      border-radius: 8px;
+    }
     label { display: inline-block; width: 120px; }
-    input { background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 4px 6px; }
-    button { margin-right: 0.5rem; padding: 0.4rem 0.8rem; border-radius: 4px; background: #2b6; color: #fff; border: none; cursor: pointer; }
+    input {
+      background: #111;
+      color: #eee;
+      border: 1px solid #444;
+      border-radius: 4px;
+      padding: 4px 6px;
+    }
+    button {
+      margin-right: 0.5rem;
+      padding: 0.4rem 0.8rem;
+      border-radius: 4px;
+      background: #2b6;
+      color: #fff;
+      border: none;
+      cursor: pointer;
+    }
     button.stop { background: #b33; }
-    pre { max-height: 400px; overflow-y: auto; background: #000; padding: 0.5rem; border-radius: 4px; }
+    button.mute { background: #666; }
+    pre {
+      max-height: 400px;
+      overflow-y: auto;
+      background: #000;
+      padding: 0.5rem;
+      border-radius: 4px;
+    }
     a { color: #6cf; }
-    .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.8rem; }
+    .badge {
+      display: inline-block;
+      padding: 0.1rem 0.5rem;
+      border-radius: 999px;
+      font-size: 0.8rem;
+    }
     .badge.ok { background: #2b6; }
     .badge.err { background: #b33; }
     .nowplaying {
@@ -503,6 +586,7 @@ INDEX_HTML = """
     <div style="margin-top:0.5rem;">
       <button onclick="start()">Start</button>
       <button class="stop" onclick="stop()">Stop</button>
+      <button id="muteBtn" class="mute" onclick="toggleMute()">Mute</button>
       <span id="health" class="badge">health: ?</span>
     </div>
   </div>
@@ -531,11 +615,24 @@ INDEX_HTML = """
   </div>
 
 <script>
+let mutedState = false;  // frontend view of mute state
+
+async function updateMuteButtonFromStatus(statusJson) {
+  if (typeof statusJson.muted === 'boolean') {
+    mutedState = statusJson.muted;
+  }
+  const btn = document.getElementById('muteBtn');
+  if (btn) {
+    btn.textContent = mutedState ? 'Unmute' : 'Mute';
+  }
+}
+
 async function refreshStatus() {
   try {
     const r = await fetch('/status');
     const j = await r.json();
     document.getElementById('status').textContent = JSON.stringify(j, null, 2);
+    updateMuteButtonFromStatus(j);
   } catch (e) {
     document.getElementById('status').textContent = 'error: ' + e;
   }
@@ -604,6 +701,27 @@ async function stop() {
   refreshStatus();
 }
 
+async function toggleMute() {
+  try {
+    const r = await fetch('/mute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    const j = await r.json();
+    if (typeof j.muted === 'boolean') {
+      mutedState = j.muted;
+    }
+    const btn = document.getElementById('muteBtn');
+    if (btn) {
+      btn.textContent = mutedState ? 'Unmute' : 'Mute';
+    }
+    refreshStatus();
+  } catch (e) {
+    alert('mute error: ' + e);
+  }
+}
+
 async function refreshNowPlaying() {
   try {
     const r = await fetch('/history');
@@ -615,10 +733,10 @@ async function refreshNowPlaying() {
       return;
     }
 
-    const events = j.events || [];
+    // Show newest at TOP (reverse order)
+    const events = j.events.slice().reverse();
 
-    // newest first
-    const lines = events.slice().reverse().map(ev => {
+    const lines = events.map(ev => {
       const parts = [];
 
       if (ev.timestamp) {
@@ -659,6 +777,7 @@ refreshNowPlaying();
 </body>
 </html>
 """
+
 
 @app.get("/")
 def index():

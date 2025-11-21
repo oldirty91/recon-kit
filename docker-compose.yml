@@ -101,3 +101,19 @@ services:
       - OP25_RX_PY=/opt/op25/op25/gr-op25_repeater/apps/rx.py
     ports:
       - "9005:9005"
+
+  adsb:
+    build: ./tools/adsb
+    container_name: recon-adsb
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - "/dev/bus/usb:/dev/bus/usb"
+    environment:
+      - RTL_DEVICE_INDEX=1
+      - PORT=8086
+      - HOME_LAT=41.5
+      - HOME_LON=-70.5
+      - GPS_URL=http://gps:8085/position
+    ports:
+      - "8086:8086"
