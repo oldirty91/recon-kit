@@ -143,8 +143,9 @@ def _build_cmd(
         "-2",            # phase 2
         "--nocrypt",     # skip encrypted
         "-l", "8765",    # OP25 terminal / HTTP port
-        "-U",            # enable UDP audio
-        "-O", audio_dev, # ALSA / audio sink (null when muted)
+        "-w",                 # enable external UDP audio / wireshark-style stream
+        "-W", "recon-mixer",  # <host> to send UDP audio to (service name of mixer)
+        "-V",
         "-v", "10",      # verbose so we see TG + radio IDs in the log
     ]
 

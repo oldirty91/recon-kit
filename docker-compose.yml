@@ -117,3 +117,24 @@ services:
       - GPS_URL=http://gps:8085/position
     ports:
       - "8086:8086"
+
+  mixer:
+    build: ./tools/mixer
+    container_name: recon-mixer
+    restart: unless-stopped
+
+    devices:
+      - "/dev/snd:/dev/snd"
+    # privileged: true   # If dev/snd mapping has trouble on your Pi
+
+    environment:
+      - HTTP_PORT=8087
+      - ALSA_DEVICE=plughw:2,0
+      - OUTPUT_RATE=48000
+      - FRAME_MS=20
+      - STALE_SEC=5
+      #- INITIAL_INPUTS=7355:p25:23456
+
+    ports:
+      - "8087:8087"      # HTTP control API
+      - "7355:7355/udp"  # Optional; containers already see mixer internally
