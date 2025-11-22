@@ -622,8 +622,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script>
 let audioCtx = null;
 let ws = null;
-let nextPlayTime = 0;
 
+// simple helper
 async function fetchJSON(url, options) {
   const res = await fetch(url, options || {});
   if (!res.ok) {
@@ -639,14 +639,14 @@ function fmtSeconds(sec) {
 
 function ensureWebAudio() {
   if (!audioCtx) {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 48000});
+    const AC = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new AC();
   }
   if (audioCtx.state === "suspended") {
     audioCtx.resume();
   }
-  if (nextPlayTime < audioCtx.currentTime) {
-    nextPlayTime = audioCtx.currentTime;
-  }
+  // On mobile, make sure WS is connected as part of user gesture
+  connectWS();
 }
 
 function connectWS() {
@@ -669,9 +669,16 @@ function connectWS() {
   };
   ws.onmessage = (event) => {
     if (!audioCtx) return;
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume();
+    }
     const buf = event.data;
     const int16 = new Int16Array(buf);
-    const audioBuf = audioCtx.createBuffer(1, int16.length, 48000);
+    if (!int16.length) return;
+
+    // Use context's sample rate for the buffer
+    const sr = audioCtx.sampleRate || 48000;
+    const audioBuf = audioCtx.createBuffer(1, int16.length, sr);
     const ch = audioBuf.getChannelData(0);
     for (let i = 0; i < int16.length; i++) {
       ch[i] = int16[i] / 32768.0;
@@ -679,12 +686,7 @@ function connectWS() {
     const src = audioCtx.createBufferSource();
     src.buffer = audioBuf;
     src.connect(audioCtx.destination);
-
-    if (nextPlayTime < audioCtx.currentTime) {
-      nextPlayTime = audioCtx.currentTime;
-    }
-    src.start(nextPlayTime);
-    nextPlayTime += audioBuf.duration;
+    src.start(); // play ASAP - simpler and more iOS-friendly
   };
 }
 
@@ -714,10 +716,13 @@ async function refreshStatus() {
       <div>Inputs: <b>${inputs.length}</b></div>
     `;
 
-    // Output mode select
+    // Output mode select - only initialize once from server
     const sel = document.getElementById("output_mode");
-    if (status.output_mode && ["alsa","web","both"].includes(status.output_mode)) {
-      sel.value = status.output_mode;
+    if (!window._outputModeInitialized) {
+      if (status.output_mode && ["alsa","web","both"].includes(status.output_mode)) {
+        sel.value = status.output_mode;
+      }
+      window._outputModeInitialized = true;
     }
 
     // Tone controls display
@@ -850,12 +855,27 @@ document.getElementById("btn-output-apply").addEventListener("click", async () =
   }
 });
 
+// Also apply immediately when the dropdown changes
+document.getElementById("output_mode").addEventListener("change", async () => {
+  const mode = document.getElementById("output_mode").value;
+  try {
+    await fetchJSON("/output_mode", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ mode }),
+    });
+    await refreshStatus();
+  } catch (err) {
+    console.error("Error setting output mode:", err);
+  }
+});
+
 // Browser audio enable
 document.getElementById("btn-web-audio").addEventListener("click", () => {
   ensureWebAudio();
 });
 
-// Connect WS on load
+// Connect WS on load (desktop will work immediately; mobile needs button)
 connectWS();
 
 // Initial load + periodic refresh

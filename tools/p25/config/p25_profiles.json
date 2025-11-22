@@ -1,0 +1,31 @@
+{
+  "profiles": [
+    {
+      "id": "riscon",
+      "label": "RISCON (Local P25)",
+      "talkgroups_tsv": "/config/riscon.tsv",
+
+      "udp_targets": [
+        { "host": "recon-mixer",       "port": 9100 }
+      ],
+
+      "raw_cmd": [
+        "python3",
+        "/opt/op25/op25/gr-op25_repeater/apps/rx.py",
+        "--args", "rtl={rtl_index}",
+        "-S", "1000000",
+        "-q", "0",
+        "--gains", "lna:40",
+        "-T", "/config/trunk.tsv",
+        "-2",
+        "--nocrypt",
+        "-l", "8765",
+        "-w",
+        "-W", "127.0.0.1",
+        "-u", "{udp_port}",
+        "-V",
+        "-v", "10"
+      ]
+    }
+  ]
+}

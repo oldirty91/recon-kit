@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import os
 import json
-import subprocess
+import socket
 import threading
+import subprocess
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import re
 import csv
 
@@ -14,54 +15,97 @@ app = Flask(__name__)
 
 # ---------- Paths / Config ----------
 
-OP25_RX = "/opt/op25/op25/gr-op25_repeater/apps/rx.py"
+CONFIG_PATH = os.getenv("P25_PROFILE_CONFIG", "/config/p25_profiles.json")
+
 OP25_APPS_DIR = "/opt/op25/op25/gr-op25_repeater/apps"
 OP25_TDMA_DIR = "/opt/op25/op25/gr-op25_repeater/apps/tdma"
-OP25_PY_DIR = "/opt/op25/op25/gr-op25_repeater/python"
-OP25_TX_DIR = "/opt/op25/op25/gr-op25_repeater/apps/tx"  # for op25_c4fm_mod
+OP25_PY_DIR   = "/opt/op25/op25/gr-op25_repeater/python"
+OP25_TX_DIR   = "/opt/op25/op25/gr-op25_repeater/apps/tx"
 
-TRUNK_TSV = "/config/trunk.tsv"
-TALKGROUPS_TSV = "/config/riscon.tsv"   # talkgroup list
-
+TRUNK_TSV_DEFAULT = "/config/trunk.tsv"  # still used in your raw_cmd
 LOG_DIR = Path("/var/log/op25")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 STDERR_LOG = LOG_DIR / "op25_stderr.log"
 
-DEFAULT_SAMPLE_RATE = 1000000  # 1 Msps
+DEFAULT_SAMPLE_RATE = 1000000  # informational only now; real value comes from raw_cmd
 DEFAULT_GAIN = 40
 DEFAULT_DEVICE_INDEX = 0
 
+# Base port to start allocating UDP listen ports for fanout
+UDP_BASE_PORT = int(os.getenv("P25_UDP_BASE_PORT", "9100"))
+
 # ---------- State ----------
 
-_proc_lock = threading.Lock()
-_proc: Optional[subprocess.Popen] = None
-_last_cmd: Optional[Dict[str, Any]] = None
-_last_exit_code: Optional[int] = None
+# profiles loaded from JSON
+PROFILES: Dict[str, Dict[str, Any]] = {}
 
-# Per-decoder mute (does NOT touch global ALSA)
-_muted: bool = False
+# running instances:
+#   key: instance_id (e.g. "riscon-0-1")
+#   value: dict with proc, profile_id, rtl_index, udp_port, forwarder_thread, forwarder_stop_event
+INSTANCES: Dict[str, Dict[str, Any]] = {}
+INSTANCES_LOCK = threading.Lock()
+INSTANCE_COUNTER = 0  # just to make unique ids
+
+_last_exit_code: Optional[int] = None
+_last_cmd: Optional[List[str]] = None
 
 # ---------- Talkgroup map ----------
 
 TGID_MAP: Dict[int, str] = {}
 
+# ---------- Talkgroup history parsing ----------
 
-def _load_talkgroup_map():
+_TG_PATTERNS = [
+    re.compile(r"\btgid[ =:]+(\d+)", re.I),
+    re.compile(r"\btg[ =:]+(\d+)", re.I),
+]
+_SRC_PATTERNS = [
+    re.compile(r"\bsrcaddr[ =:]+(\d+)", re.I),
+    re.compile(r"\bsrc[ =:]+(\d+)", re.I),
+]
+
+TG_HISTORY: List[Dict[str, Any]] = []
+TG_HISTORY_MAX = 200
+_LOG_READ_POS: int = 0
+_LOG_INODE: Optional[int] = None
+
+
+# ========== Helpers ==========
+
+def _load_profiles():
+    global PROFILES
+    cfg_file = Path(CONFIG_PATH)
+    if not cfg_file.exists():
+        print(f"[p25] profile config {CONFIG_PATH} not found", flush=True)
+        PROFILES = {}
+        return
+
+    try:
+        data = json.loads(cfg_file.read_text(encoding="utf-8"))
+        profiles = data.get("profiles", [])
+        PROFILES = {}
+        for p in profiles:
+            pid = p.get("id")
+            if not pid:
+                continue
+            PROFILES[pid] = p
+        print(f"[p25] loaded {len(PROFILES)} profiles from {CONFIG_PATH}", flush=True)
+    except Exception as e:
+        print(f"[p25] failed to load profiles: {e}", flush=True)
+        PROFILES = {}
+
+
+def _load_talkgroup_map_from_profile(profile: Dict[str, Any]):
     """
-    Load talkgroup names from /config/riscon.tsv into TGID_MAP.
-
-    Supports your simple 2-column TSV:
-        DEC <tab> AlphaTag
-
-    If you later switch to a Radioreference-style headered TSV,
-    this will still work as long as the first column is the DEC
-    and the second is some human-friendly name.
+    Load TGID_MAP from profile['talkgroups_tsv'] if present,
+    otherwise fall back to /config/riscon.tsv like before.
     """
     global TGID_MAP
-    tg_file = Path(TALKGROUPS_TSV)
+    tg_file = Path(profile.get("talkgroups_tsv", "/config/riscon.tsv"))
 
     if not tg_file.exists():
-        print("[p25] talkgroup file /config/riscon.tsv not found, TG names disabled", flush=True)
+        print(f"[p25] talkgroup file {tg_file} not found, TG names disabled", flush=True)
+        TGID_MAP.clear()
         return
 
     TGID_MAP.clear()
@@ -75,10 +119,8 @@ def _load_talkgroup_map():
                 if not row:
                     continue
 
-                # First column should be DEC (numeric talkgroup ID)
                 dec_str = (row[0] or "").strip()
                 if not dec_str or not re.match(r"^\d+$", dec_str):
-                    # skip non-numeric / header-ish rows
                     continue
 
                 try:
@@ -86,11 +128,9 @@ def _load_talkgroup_map():
                 except ValueError:
                     continue
 
-                # Second column is your label (Alpha Tag)
                 name = ""
                 if len(row) > 1:
                     name = (row[1] or "").strip()
-
                 if not name:
                     name = f"TG {tgid}"
 
@@ -98,198 +138,87 @@ def _load_talkgroup_map():
                 count += 1
 
         print(f"[p25] loaded {count} talkgroup entries from {tg_file}", flush=True)
-
     except Exception as e:
         print(f"[p25] failed to load talkgroup map: {e}", flush=True)
+        TGID_MAP.clear()
 
 
-# ---------- Subprocess monitor ----------
+def _next_udp_port() -> int:
+    """Assign a unique UDP listen port for a new instance."""
+    with INSTANCES_LOCK:
+        in_use = {inst["udp_port"] for inst in INSTANCES.values()}
+        port = UDP_BASE_PORT
+        while port in in_use:
+            port += 1
+        return port
 
-def _monitor_proc(p: subprocess.Popen):
-    """Background monitor: wait for process to exit and record exit code."""
-    global _proc, _last_exit_code
-    exit_code = p.wait()
-    with _proc_lock:
+
+def _make_instance_id(profile_id: str, rtl_index: int) -> str:
+    global INSTANCE_COUNTER
+    with INSTANCES_LOCK:
+        INSTANCE_COUNTER += 1
+        return f"{profile_id}-{rtl_index}-{INSTANCE_COUNTER}"
+
+
+def _build_cmd_from_profile(profile: Dict[str, Any], rtl_index: int, udp_port: int) -> List[str]:
+    """
+    Take profile['raw_cmd'] and substitute {rtl_index} and {udp_port}.
+    """
+    raw_cmd = profile.get("raw_cmd")
+    if not raw_cmd or not isinstance(raw_cmd, list):
+        raise RuntimeError(f"profile {profile.get('id')} missing raw_cmd list")
+
+    new_cmd = []
+    for tok in raw_cmd:
+        if isinstance(tok, str):
+            tok = tok.replace("{rtl_index}", str(rtl_index)).replace("{udp_port}", str(udp_port))
+        new_cmd.append(tok)
+    return new_cmd
+
+
+def _monitor_proc(instance_id: str, proc: subprocess.Popen):
+    """Background monitor: record exit and clean up instance when process exits."""
+    global _last_exit_code, _last_cmd
+    exit_code = proc.wait()
+    with INSTANCES_LOCK:
+        inst = INSTANCES.get(instance_id)
+        if inst is not None:
+            inst["running"] = False
         _last_exit_code = exit_code
-        _proc = None
+        # keep _last_cmd as last launched command (for /status)
 
 
-def _build_cmd(
-    device_index: int,
-    sample_rate: int,
-    lna_gain: int,
-    muted: bool = False,
-) -> Dict[str, Any]:
+def _udp_fanout_thread(udp_port: int, targets: List[Dict[str, Any]], stop_event: threading.Event):
     """
-    Build the rx.py command line.
-    Use osmosdr-style args: rtl=<index>, no separate -d.
-
-    If muted=True, send audio to a null sink instead of the Pi's ALSA device.
+    Listen on udp_port and fan the raw audio to all targets.
     """
-    args_str = f"rtl={device_index}"
-
-    # When muted, send audio to a dummy sink; when unmuted, to the Pi card.
-    # You can change "null" to another ALSA sink if you like.
-    audio_dev = "null" if muted else "plughw:2,0"
-
-    cmd = [
-        "python3",
-        OP25_RX,
-        "--args", args_str,
-        "-S", str(sample_rate),
-        "-q", "0",
-        "--gains", f"lna:{lna_gain}",
-        "-T", TRUNK_TSV,
-        "-2",            # phase 2
-        "--nocrypt",     # skip encrypted
-        "-l", "8765",    # OP25 terminal / HTTP port
-        "-w",                 # enable external UDP audio / wireshark-style stream
-        "-W", "recon-mixer",  # <host> to send UDP audio to (service name of mixer)
-        "-V",
-        "-v", "10",      # verbose so we see TG + radio IDs in the log
-    ]
-
-    return {
-        "cmd": cmd,
-        "overrides": {
-            "device_index": device_index,
-            "sample_rate": sample_rate,
-            "lna_gain": lna_gain,
-        },
-        "stderr_path": str(STDERR_LOG),
-    }
-
-
-# ---------- API endpoints ----------
-
-@app.get("/healthz")
-def healthz():
-    return jsonify({"status": "ok"})
-
-
-@app.get("/status")
-def status():
-    with _proc_lock:
-        running = _proc is not None and _proc.poll() is None
-        pid = _proc.pid if running and _proc is not None else None
-        return jsonify({
-            "running": running,
-            "pid": pid,
-            "last_exit_code": _last_exit_code,
-            "last_config": _last_cmd,
-            "muted": _muted,
-        })
-
-
-@app.post("/start")
-def start():
-    global _proc, _last_cmd, _last_exit_code
-
-    data = request.get_json(silent=True) or {}
-    device_index = int(data.get("device_index", DEFAULT_DEVICE_INDEX))
-    sample_rate = int(data.get("sample_rate", DEFAULT_SAMPLE_RATE))
-    lna_gain = int(data.get("lna_gain", DEFAULT_GAIN))
-
-    # Sanity checks
-    if not os.path.exists(OP25_RX):
-        return jsonify({"error": f"rx.py not found at {OP25_RX}"}), 500
-
-    if not os.path.exists(TRUNK_TSV):
-        return jsonify({"error": f"trunk.tsv not found at {TRUNK_TSV}"}), 500
-
-    with _proc_lock:
-        if _proc is not None and _proc.poll() is None:
-            return jsonify({"error": "op25 already running"}), 409
-
-        cfg = _build_cmd(device_index, sample_rate, lna_gain, muted=_muted)
-        cmd = cfg["cmd"]
-        _last_cmd = cfg
-        _last_exit_code = None
-
-        STDERR_LOG.parent.mkdir(parents=True, exist_ok=True)
-        stderr_f = open(STDERR_LOG, "ab", buffering=0)
-
-        # Ensure all OP25 dirs are on PYTHONPATH
-        env = os.environ.copy()
-        extra_paths = [
-            OP25_APPS_DIR,
-            OP25_TDMA_DIR,
-            OP25_PY_DIR,
-            OP25_TX_DIR,
-        ]
-        existing_py = env.get("PYTHONPATH", "")
-        extra = ":".join(extra_paths)
-        env["PYTHONPATH"] = extra + (":" + existing_py if existing_py else "")
-
-        # run from /config so relative tsv paths work
-        p = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=stderr_f,
-            env=env,
-            cwd="/config",
-        )
-        _proc = p
-
-        t = threading.Thread(target=_monitor_proc, args=(p,), daemon=True)
-        t.start()
-
-        return jsonify({
-            "status": "started",
-            "pid": p.pid,
-            "cmd": cmd,
-            "stderr_path": str(STDERR_LOG),
-            "pythonpath": env["PYTHONPATH"],
-            "cwd": "/config",
-            "muted": _muted,
-        })
-
-
-@app.post("/stop")
-def stop():
-    global _proc
-    with _proc_lock:
-        if _proc is None or _proc.poll() is not None:
-            return jsonify({"status": "not_running"})
-        _proc.terminate()
-        return jsonify({"status": "stopping", "pid": _proc.pid})
-
-
-@app.get("/logs")
-def logs():
-    """Return tail of stderr log."""
-    if not STDERR_LOG.exists():
-        return jsonify({"lines": [], "error": "no log file"}), 200
+    print(f"[p25] UDP fanout listening on 0.0.0.0:{udp_port} -> {targets}", flush=True)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", udp_port))
+    sock.settimeout(1.0)
 
     try:
-        with STDERR_LOG.open("rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            start = max(0, size - 4096)
-            f.seek(start, os.SEEK_SET)
-            chunk = f.read().decode(errors="replace")
-        lines = chunk.splitlines()[-200:]
-        return jsonify({"lines": lines})
-    except Exception as e:
-        return jsonify({"lines": [], "error": str(e)}), 500
+        while not stop_event.is_set():
+            try:
+                data, addr = sock.recvfrom(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
 
-
-# ---------- Talkgroup history / now-playing ----------
-
-_TG_PATTERNS = [
-    re.compile(r"\btgid[ =:]+(\d+)", re.I),
-    re.compile(r"\btg[ =:]+(\d+)", re.I),
-]
-_SRC_PATTERNS = [
-    re.compile(r"\bsrcaddr[ =:]+(\d+)", re.I),
-    re.compile(r"\bsrc[ =:]+(\d+)", re.I),
-]
-
-# In-memory persistent history: newest last
-TG_HISTORY: list[Dict[str, Any]] = []
-TG_HISTORY_MAX = 200
-_LOG_READ_POS: int = 0
-_LOG_INODE: Optional[int] = None
+            for tgt in targets:
+                host = tgt.get("host")
+                port = int(tgt.get("port", udp_port))
+                if not host:
+                    continue
+                try:
+                    sock.sendto(data, (host, port))
+                except OSError:
+                    # don't kill the thread for a transient send error
+                    continue
+    finally:
+        sock.close()
+        print(f"[p25] UDP fanout on port {udp_port} stopped", flush=True)
 
 
 def _parse_line_to_event(line: str) -> Optional[Dict[str, Any]]:
@@ -350,7 +279,6 @@ def _update_history_from_log():
             inode = st.st_ino
             size = st.st_size
 
-            # Detect rotation / truncation
             if _LOG_INODE is None or inode != _LOG_INODE or _LOG_READ_POS > size:
                 _LOG_INODE = inode
                 _LOG_READ_POS = 0
@@ -372,10 +300,82 @@ def _update_history_from_log():
                 TG_HISTORY = TG_HISTORY[-TG_HISTORY_MAX:]
 
 
+# ========== API: basic health / logs / status ==========
+
+@app.get("/healthz")
+def healthz():
+    return jsonify({"status": "ok"})
+
+
+@app.get("/profiles")
+def list_profiles():
+    out = []
+    for pid, p in PROFILES.items():
+        out.append({
+            "id": pid,
+            "label": p.get("label", pid),
+            "talkgroups_tsv": p.get("talkgroups_tsv"),
+            "udp_targets": p.get("udp_targets", []),
+        })
+    return jsonify({"profiles": out})
+
+
+@app.get("/instances")
+def list_instances():
+    with INSTANCES_LOCK:
+        inst_list = []
+        for iid, inst in INSTANCES.items():
+            inst_list.append({
+                "instance_id": iid,
+                "profile_id": inst["profile_id"],
+                "rtl_index": inst["rtl_index"],
+                "udp_port": inst["udp_port"],
+                "running": inst.get("running", False),
+                "pid": inst["proc"].pid if inst.get("proc") and inst["proc"].poll() is None else None,
+            })
+    return jsonify({"instances": inst_list})
+
+
+@app.get("/status")
+def status():
+    with INSTANCES_LOCK:
+        running_any = any(inst.get("running", False) for inst in INSTANCES.values())
+        pid_list = [
+            inst["proc"].pid for inst in INSTANCES.values()
+            if inst.get("proc") and inst["proc"].poll() is None
+        ]
+        return jsonify({
+            "running": running_any,
+            "pids": pid_list,
+            "last_exit_code": _last_exit_code,
+            "last_cmd": _last_cmd,
+        })
+
+
+@app.get("/logs")
+def logs():
+    """Return tail of stderr log."""
+    if not STDERR_LOG.exists():
+        return jsonify({"lines": [], "error": "no log file"}), 200
+
+    try:
+        with STDERR_LOG.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(0, size - 4096)
+            f.seek(start, os.SEEK_SET)
+            chunk = f.read().decode(errors="replace")
+        lines = chunk.splitlines()[-200:]
+        return jsonify({"lines": lines})
+    except Exception as e:
+        return jsonify({"lines": [], "error": str(e)}), 500
+
+
+# ========== API: history / nowplaying ==========
+
 @app.get("/history")
 def history():
     _update_history_from_log()
-    # Return a copy so we don't leak internal mutable list
     return jsonify({"events": TG_HISTORY})
 
 
@@ -390,112 +390,184 @@ def nowplaying():
             "raw": None,
             "age_seconds": None,
         })
-
     ev = TG_HISTORY[-1]
     return jsonify({
         "talkgroup": ev.get("talkgroup"),
         "srcaddr": ev.get("srcaddr"),
         "label": ev.get("label"),
         "raw": ev.get("raw"),
-        "age_seconds": 0.0,  # we’re not doing precise timing here yet
+        "age_seconds": 0.0,
     })
 
 
-# ---------- Mute endpoint (per-decoder) ----------
+# ========== API: start/stop instances ==========
 
-@app.post("/mute")
-def mute():
+@app.post("/start_instance")
+def api_start_instance():
     """
-    Set or toggle mute state for OP25 *only* (does not touch global ALSA).
-
-    Request body:
-      { "mute": true }   -> force mute
-      { "mute": false }  -> force unmute
-      {}                 -> toggle
+    Body:
+      {
+        "profile_id": "riscon",
+        "rtl_index": 0
+      }
     """
-    global _muted, _proc, _last_cmd, _last_exit_code
+    global _last_cmd, _last_exit_code
 
     data = request.get_json(silent=True) or {}
+    profile_id = data.get("profile_id")
+    rtl_index = int(data.get("rtl_index", DEFAULT_DEVICE_INDEX))
 
-    if "mute" in data:
-        new_state = bool(data["mute"])
-    else:
-        new_state = not _muted  # toggle
+    if not profile_id or profile_id not in PROFILES:
+        return jsonify({"error": f"unknown profile_id {profile_id}"}), 400
 
-    with _proc_lock:
-        prev_state = _muted
-        _muted = new_state
+    profile = PROFILES[profile_id]
 
-        # If not running, just update state and return.
-        if _proc is None or _proc.poll() is not None:
-            return jsonify({
-                "muted": _muted,
-                "restarted": False,
-                "running": False,
-                "note": "state updated; decoder not running",
-            })
+    # Optional: sanity check trunk.tsv exists if you rely on it in raw_cmd
+    if not os.path.exists(TRUNK_TSV_DEFAULT):
+        print(f"[p25] WARNING: {TRUNK_TSV_DEFAULT} not found", flush=True)
 
-        # We *are* running: restart rx.py with new audio device
-        overrides = (_last_cmd or {}).get("overrides", {}) if _last_cmd else {}
-        device_index = int(overrides.get("device_index", DEFAULT_DEVICE_INDEX))
-        sample_rate = int(overrides.get("sample_rate", DEFAULT_SAMPLE_RATE))
-        lna_gain = int(overrides.get("lna_gain", DEFAULT_GAIN))
+    udp_port = _next_udp_port()
+    cmd = _build_cmd_from_profile(profile, rtl_index, udp_port)
 
-        try:
-            # Stop old process
-            _proc.terminate()
+    # update TG name map for this profile
+    _load_talkgroup_map_from_profile(profile)
+
+    env = os.environ.copy()
+    extra_paths = [
+        OP25_APPS_DIR,
+        OP25_TDMA_DIR,
+        OP25_PY_DIR,
+        OP25_TX_DIR,
+    ]
+    existing_py = env.get("PYTHONPATH", "")
+    extra = ":".join(extra_paths)
+    env["PYTHONPATH"] = extra + (":" + existing_py if existing_py else "")
+
+    STDERR_LOG.parent.mkdir(parents=True, exist_ok=True)
+    stderr_f = open(STDERR_LOG, "ab", buffering=0)
+
+    # Start UDP fanout thread if we have targets
+    udp_targets = profile.get("udp_targets", [])
+    fanout_thread = None
+    fanout_stop = threading.Event()
+    if udp_targets:
+        fanout_thread = threading.Thread(
+            target=_udp_fanout_thread,
+            args=(udp_port, udp_targets, fanout_stop),
+            daemon=True,
+        )
+        fanout_thread.start()
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_f,
+            env=env,
+            cwd="/config",
+        )
+    except Exception as e:
+        # stop fanout if process launch failed
+        if fanout_thread is not None:
+            fanout_stop.set()
+        return jsonify({"error": f"failed to start rx.py: {e}"}), 500
+
+    instance_id = _make_instance_id(profile_id, rtl_index)
+    inst_rec = {
+        "instance_id": instance_id,
+        "profile_id": profile_id,
+        "rtl_index": rtl_index,
+        "udp_port": udp_port,
+        "proc": proc,
+        "running": True,
+        "fanout_thread": fanout_thread,
+        "fanout_stop": fanout_stop,
+    }
+
+    with INSTANCES_LOCK:
+        INSTANCES[instance_id] = inst_rec
+        _last_cmd = cmd
+        _last_exit_code = None
+
+    t = threading.Thread(target=_monitor_proc, args=(instance_id, proc), daemon=True)
+    t.start()
+
+    return jsonify({
+        "status": "started",
+        "instance_id": instance_id,
+        "profile_id": profile_id,
+        "rtl_index": rtl_index,
+        "udp_port": udp_port,
+        "cmd": cmd,
+        "udp_targets": udp_targets,
+    })
+
+
+@app.post("/stop_instance")
+def api_stop_instance():
+    """
+    Body can be either:
+      { "instance_id": "riscon-0-1" }
+    or
+      { "rtl_index": 0 }
+    If rtl_index is used and multiple instances share it, all are stopped.
+    """
+    data = request.get_json(silent=True) or {}
+    instance_id = data.get("instance_id")
+    rtl_index = data.get("rtl_index")
+
+    to_stop: List[str] = []
+
+    with INSTANCES_LOCK:
+        if instance_id:
+            if instance_id in INSTANCES:
+                to_stop.append(instance_id)
+            else:
+                return jsonify({"error": f"instance_id {instance_id} not found"}), 404
+        elif rtl_index is not None:
+            rtl_index = int(rtl_index)
+            for iid, inst in list(INSTANCES.items()):
+                if inst["rtl_index"] == rtl_index:
+                    to_stop.append(iid)
+            if not to_stop:
+                return jsonify({"status": "no_instances_for_rtl", "rtl_index": rtl_index})
+        else:
+            return jsonify({"error": "must provide instance_id or rtl_index"}), 400
+
+    results = []
+    for iid in to_stop:
+        with INSTANCES_LOCK:
+            inst = INSTANCES.get(iid)
+        if not inst:
+            continue
+
+        proc: subprocess.Popen = inst["proc"]
+        fanout_stop: threading.Event = inst["fanout_stop"]
+        fanout_thread: Optional[threading.Thread] = inst["fanout_thread"]
+
+        if proc and proc.poll() is None:
             try:
-                _proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                _proc.kill()
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except Exception as e:
+                results.append({"instance_id": iid, "error": str(e)})
+                continue
 
-            # Build new command with updated mute state
-            cfg = _build_cmd(device_index, sample_rate, lna_gain, muted=_muted)
-            cmd = cfg["cmd"]
-            _last_cmd = cfg
-            _last_exit_code = None
+        # stop fanout
+        if fanout_stop:
+            fanout_stop.set()
 
-            STDERR_LOG.parent.mkdir(parents=True, exist_ok=True)
-            stderr_f = open(STDERR_LOG, "ab", buffering=0)
+        # we don't join thread here; it's daemon, will exit once stop_event set
 
-            env = os.environ.copy()
-            extra_paths = [
-                OP25_APPS_DIR,
-                OP25_TDMA_DIR,
-                OP25_PY_DIR,
-                OP25_TX_DIR,
-            ]
-            existing_py = env.get("PYTHONPATH", "")
-            extra = ":".join(extra_paths)
-            env["PYTHONPATH"] = extra + (":" + existing_py if existing_py else "")
+        with INSTANCES_LOCK:
+            INSTANCES.pop(iid, None)
 
-            p = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=stderr_f,
-                env=env,
-                cwd="/config",
-            )
-            _proc = p
+        results.append({"instance_id": iid, "stopped": True})
 
-            t = threading.Thread(target=_monitor_proc, args=(p,), daemon=True)
-            t.start()
-
-            return jsonify({
-                "muted": _muted,
-                "restarted": True,
-                "running": True,
-                "pid": p.pid,
-                "cmd": cmd,
-            })
-        except Exception as e:
-            # Roll back mute flag if restart fails
-            _muted = prev_state
-            return jsonify({
-                "muted": _muted,
-                "error": str(e),
-                "restarted": False,
-            }), 500
+    return jsonify({"results": results})
 
 
 # ---------- Simple Web GUI ----------
@@ -509,14 +581,14 @@ INDEX_HTML = """
   <style>
     body { font-family: sans-serif; padding: 1rem; background: #111; color: #eee; }
     h1 { margin-top: 0; }
-    .controls, .status, .logs, .help {
+    .controls, .status, .logs, .help, .instances, .nowplaying {
       margin-bottom: 1rem;
       padding: 1rem;
       background: #222;
       border-radius: 8px;
     }
-    label { display: inline-block; width: 120px; }
-    input {
+    label { display: inline-block; width: 140px; }
+    input, select {
       background: #111;
       color: #eee;
       border: 1px solid #444;
@@ -533,7 +605,6 @@ INDEX_HTML = """
       cursor: pointer;
     }
     button.stop { background: #b33; }
-    button.mute { background: #666; }
     pre {
       max-height: 400px;
       overflow-y: auto;
@@ -550,51 +621,58 @@ INDEX_HTML = """
     }
     .badge.ok { background: #2b6; }
     .badge.err { background: #b33; }
-    .nowplaying {
-      margin-bottom: 1rem;
-      padding: 1rem;
-      background: #222;
-      border-radius: 8px;
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
     }
-    .nowplaying pre {
-      max-height: 240px;
-      overflow-y: auto;
-      background: #111;
-      padding: 0.5rem;
-      border-radius: 4px;
-      font-size: 0.8rem;
-      line-height: 1.3;
+    th, td {
+      padding: 4px 6px;
+      border-bottom: 1px solid #333;
+      text-align: left;
     }
   </style>
 </head>
 <body>
-  <h1>Recon P25 Decoder</h1>
+  <h1>Recon P25 Decoder (Multi-Instance)</h1>
 
   <div class="controls">
-    <h2>Controls</h2>
+    <h2>Start Instance</h2>
+    <div>
+      <label>Profile</label>
+      <select id="profile_select"></select>
+    </div>
     <div>
       <label>RTL Device Index</label>
-      <input id="device_index" type="number" value="0" min="0" />
-    </div>
-    <div>
-      <label>Sample Rate (Hz)</label>
-      <input id="sample_rate" type="number" value="1000000" />
-    </div>
-    <div>
-      <label>LNA Gain (dB)</label>
-      <input id="lna_gain" type="number" value="40" />
+      <input id="rtl_index" type="number" value="0" min="0" />
     </div>
     <div style="margin-top:0.5rem;">
-      <button onclick="start()">Start</button>
-      <button class="stop" onclick="stop()">Stop</button>
-      <button id="muteBtn" class="mute" onclick="toggleMute()">Mute</button>
+      <button onclick="startInstance()">Start Instance</button>
       <span id="health" class="badge">health: ?</span>
     </div>
   </div>
 
+  <div class="instances">
+    <h2>Running Instances</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Instance ID</th>
+          <th>Profile</th>
+          <th>RTL</th>
+          <th>UDP Port</th>
+          <th>PID</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="instances_tbody">
+      </tbody>
+    </table>
+  </div>
+
   <div class="nowplaying">
     <h2>Now Playing (History)</h2>
-    <pre id="nowplaying">Idle / no recent voice traffic</pre>
+    <pre id="nowplaying">Idle / no recent voice activity</pre>
   </div>
 
   <div class="status">
@@ -616,15 +694,44 @@ INDEX_HTML = """
   </div>
 
 <script>
-let mutedState = false;  // frontend view of mute state
-
-async function updateMuteButtonFromStatus(statusJson) {
-  if (typeof statusJson.muted === 'boolean') {
-    mutedState = statusJson.muted;
+async function loadProfiles() {
+  try {
+    const r = await fetch('/profiles');
+    const j = await r.json();
+    const sel = document.getElementById('profile_select');
+    sel.innerHTML = '';
+    (j.profiles || []).forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = p.label || p.id;
+      sel.appendChild(opt);
+    });
+  } catch (e) {
+    console.error('loadProfiles error', e);
   }
-  const btn = document.getElementById('muteBtn');
-  if (btn) {
-    btn.textContent = mutedState ? 'Unmute' : 'Mute';
+}
+
+async function refreshInstances() {
+  try {
+    const r = await fetch('/instances');
+    const j = await r.json();
+    const tbody = document.getElementById('instances_tbody');
+    tbody.innerHTML = '';
+
+    (j.instances || []).forEach(inst => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${inst.instance_id}</td>
+        <td>${inst.profile_id}</td>
+        <td>${inst.rtl_index}</td>
+        <td>${inst.udp_port}</td>
+        <td>${inst.pid || ''}</td>
+        <td><button class="stop" onclick="stopInstance('${inst.instance_id}')">Stop</button></td>
+      `;
+      tbody.appendChild(tr);
+    });
+  } catch (e) {
+    console.error('refreshInstances error', e);
   }
 }
 
@@ -633,7 +740,6 @@ async function refreshStatus() {
     const r = await fetch('/status');
     const j = await r.json();
     document.getElementById('status').textContent = JSON.stringify(j, null, 2);
-    updateMuteButtonFromStatus(j);
   } catch (e) {
     document.getElementById('status').textContent = 'error: ' + e;
   }
@@ -672,55 +778,40 @@ async function refreshLogs() {
   }
 }
 
-async function start() {
-  const device_index = parseInt(document.getElementById('device_index').value || '0', 10);
-  const sample_rate = parseInt(document.getElementById('sample_rate').value || '1000000', 10);
-  const lna_gain = parseInt(document.getElementById('lna_gain').value || '40', 10);
+async function startInstance() {
+  const sel = document.getElementById('profile_select');
+  const profile_id = sel.value;
+  const rtl_index = parseInt(document.getElementById('rtl_index').value || '0', 10);
 
   try {
-    const r = await fetch('/start', {
+    const r = await fetch('/start_instance', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ device_index, sample_rate, lna_gain })
+      body: JSON.stringify({ profile_id, rtl_index })
     });
     const j = await r.json();
-    alert('start: ' + JSON.stringify(j));
+    alert('start_instance: ' + JSON.stringify(j));
   } catch (e) {
-    alert('start error: ' + e);
+    alert('start_instance error: ' + e);
   }
   refreshStatus();
+  refreshInstances();
 }
 
-async function stop() {
+async function stopInstance(instance_id) {
   try {
-    const r = await fetch('/stop', { method: 'POST' });
-    const j = await r.json();
-    alert('stop: ' + JSON.stringify(j));
-  } catch (e) {
-    alert('stop error: ' + e);
-  }
-  refreshStatus();
-}
-
-async function toggleMute() {
-  try {
-    const r = await fetch('/mute', {
+    const r = await fetch('/stop_instance', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({})
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ instance_id })
     });
     const j = await r.json();
-    if (typeof j.muted === 'boolean') {
-      mutedState = j.muted;
-    }
-    const btn = document.getElementById('muteBtn');
-    if (btn) {
-      btn.textContent = mutedState ? 'Unmute' : 'Mute';
-    }
-    refreshStatus();
+    alert('stop_instance: ' + JSON.stringify(j));
   } catch (e) {
-    alert('mute error: ' + e);
+    alert('stop_instance error: ' + e);
   }
+  refreshStatus();
+  refreshInstances();
 }
 
 async function refreshNowPlaying() {
@@ -734,7 +825,6 @@ async function refreshNowPlaying() {
       return;
     }
 
-    // Show newest at TOP (reverse order)
     const events = j.events.slice().reverse();
 
     const lines = events.map(ev => {
@@ -770,6 +860,10 @@ setInterval(refreshStatus, 2000);
 setInterval(refreshLogs, 2000);
 setInterval(refreshHealth, 5000);
 setInterval(refreshNowPlaying, 1000);
+setInterval(refreshInstances, 3000);
+
+loadProfiles();
+refreshInstances();
 refreshStatus();
 refreshLogs();
 refreshHealth();
@@ -779,12 +873,15 @@ refreshNowPlaying();
 </html>
 """
 
-
 @app.get("/")
 def index():
     return Response(INDEX_HTML, mimetype="text/html")
 
 
 if __name__ == "__main__":
-    _load_talkgroup_map()
+    _load_profiles()
+    # default: load TG names from first profile if any
+    if PROFILES:
+        first = next(iter(PROFILES.values()))
+        _load_talkgroup_map_from_profile(first)
     app.run(host="0.0.0.0", port=9005)
